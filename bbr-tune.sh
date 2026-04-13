@@ -6,7 +6,6 @@
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
@@ -73,7 +72,6 @@ EOF
 # BBR 配置生成函数
 # ============================================================
 
-# 参数：$1=内存(mb) $2=rmem_max $3=wmem_max $4=tcp_mem $5=tcp_notsent_lowat $6=adv_win_scale $7=min_free_kbytes $8=swappiness
 generate_config() {
     local RMEM_MAX=$1
     local WMEM_MAX=$2
@@ -82,6 +80,7 @@ generate_config() {
     local ADV_WIN=$5
     local MIN_FREE=$6
     local SWAPPINESS=$7
+    local TCP_RMEM_DEFAULT=$8
 
     cat << EOF
 # BBR TCP 调优配置
@@ -119,8 +118,8 @@ net.core.wmem_default = 262144
 # ============================================================
 # TCP 缓冲区
 # ============================================================
-net.ipv4.tcp_rmem = 32768 1048576 ${RMEM_MAX}
-net.ipv4.tcp_wmem = 32768 1048576 ${WMEM_MAX}
+net.ipv4.tcp_rmem = 32768 ${TCP_RMEM_DEFAULT} ${RMEM_MAX}
+net.ipv4.tcp_wmem = 32768 ${TCP_RMEM_DEFAULT} ${WMEM_MAX}
 net.ipv4.tcp_mem = ${TCP_MEM}
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
@@ -177,16 +176,85 @@ EOF
 }
 
 # ============================================================
-# BBR 调优菜单
+# BBR 调优核心逻辑
+# 参数：MEM_MB  LAT_MS  BW_MBPS
+# ============================================================
+
+calc_and_apply() {
+    local MEM_MB=$1
+    local LAT_MS=$2   # 50=100以内  150=100-200  250=200以上
+    local BW_MBPS=$3
+    local MEM_LABEL=$4
+    local LAT_LABEL=$5
+    local BW_LABEL=$6
+
+    # BDP = 带宽(MB/s) × RTT(s)
+    # 缓冲 = BDP × 1.5，向上取整到常用值
+    local BW_MBS=$(( BW_MBPS / 8 ))
+    local BDP_KB=$(( BW_MBS * LAT_MS / 1000 ))   # KB
+    local BUF_KB=$(( BDP_KB * 3 / 2 ))
+
+    # 根据 BDP 选择缓冲区大小（MB）
+    local RMEM WMEM ADV_WIN NOTSENT TCP_RMEM_DEFAULT
+    if   [ "$BUF_KB" -le 10240  ]; then RMEM=12582912;  WMEM=12582912;  ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_KB" -le 20480  ]; then RMEM=20971520;  WMEM=20971520;  ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_KB" -le 40960  ]; then RMEM=41943040;  WMEM=41943040;  ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=4194304
+    elif [ "$BUF_KB" -le 65536  ]; then RMEM=67108864;  WMEM=67108864;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=4194304
+    else                                RMEM=134217728; WMEM=134217728; ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=4194304
+    fi
+
+    # 内存相关参数
+    local MIN_FREE SWAP TCP_MEM
+    if [ "$MEM_MB" -eq 512 ]; then
+        MIN_FREE=32768; SWAP=10
+        local TCP_HARD=$(( MEM_MB * 1024 / 4 / 4 ))  # 25% of mem in pages
+        TCP_MEM="$(( TCP_HARD/4 )) $(( TCP_HARD/3 )) ${TCP_HARD}"
+    elif [ "$MEM_MB" -eq 1024 ]; then
+        MIN_FREE=65536; SWAP=10
+        TCP_MEM="49152 65536 131072"
+    else
+        MIN_FREE=65536; SWAP=5
+        TCP_MEM="131072 196608 393216"
+    fi
+
+    local BUF_MB=$(( (RMEM + 524288) / 1048576 ))
+    local BDP_MB=$(( (BDP_KB + 512) / 1024 ))
+
+    echo ""
+    echo -e "${YELLOW}配置摘要：${NC}"
+    echo -e "  内存：${MEM_LABEL}  延迟：${LAT_LABEL}  带宽：${BW_LABEL}"
+    echo -e "  BDP 估算：${BDP_MB}MB  →  缓冲区：${BUF_MB}MB"
+    echo -e "  rmem/wmem max：${BUF_MB}MB"
+    echo -e "  tcp_rmem default：$(( TCP_RMEM_DEFAULT / 1048576 ))MB"
+    echo -e "  min_free_kbytes：${MIN_FREE}"
+    echo -e "  tcp_mem：${TCP_MEM}"
+    echo ""
+    read -rp "确认应用？[y/N]：" CONFIRM
+    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        local CONFIG
+        CONFIG=$(generate_config "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT")
+        apply_sysctl "$CONFIG"
+        echo ""
+        echo -e "${GREEN}✓ BBR TCP 调优配置完成${NC}"
+        echo -e "${YELLOW}提示：建议配合限速设置使用，避免 Retr 爆炸${NC}"
+    else
+        echo -e "${YELLOW}已取消${NC}"
+    fi
+}
+
+# ============================================================
+# BBR 菜单 — 带宽选择
 # ============================================================
 
 menu_bbr_bandwidth() {
     local MEM_MB=$1
-    local MEM_LABEL=$2
+    local LAT_MS=$2
+    local MEM_LABEL=$3
+    local LAT_LABEL=$4
 
     while true; do
         echo ""
-        echo -e "${BOLD}内存：${MEM_LABEL} — 请选择带宽配置${NC}"
+        echo -e "${BOLD}内存：${MEM_LABEL}  延迟：${LAT_LABEL} — 请选择带宽${NC}"
         echo ""
         echo -e "  ${BOLD}1.${NC} 500 Mbps"
         echo -e "  ${BOLD}2.${NC} 1 Gbps  (1024 Mbps)"
@@ -196,72 +264,47 @@ menu_bbr_bandwidth() {
         read -rp "请选择 [0-3]：" BW_CHOICE
 
         case $BW_CHOICE in
-            1)
-                # 500Mbps — BDP=6.25MB，缓冲20MB
-                # 512MB: min_free=32768 swappiness=10 tcp_mem=16384/21845/32768
-                # 1GB:   min_free=65536 swappiness=10 tcp_mem=49152/65536/98304
-                # 2GB:   min_free=65536 swappiness=5  tcp_mem=49152/65536/131072
-                local RMEM=20971520
-                local WMEM=20971520
-                local NOTSENT=131072
-                local ADV_WIN=2
-                if   [ "$MEM_MB" -eq 512 ];  then MIN_FREE=32768;  SWAP=10; TCP_MEM="16384 21845 32768"
-                elif [ "$MEM_MB" -eq 1024 ]; then MIN_FREE=65536;  SWAP=10; TCP_MEM="49152 65536 98304"
-                else                              MIN_FREE=65536;  SWAP=5;  TCP_MEM="49152 65536 131072"
-                fi
-                ;;
-            2)
-                # 1Gbps — BDP=12.5MB，缓冲40MB
-                local RMEM=41943040
-                local WMEM=41943040
-                local NOTSENT=262144
-                local ADV_WIN=3
-                if   [ "$MEM_MB" -eq 512 ];  then MIN_FREE=32768;  SWAP=10; TCP_MEM="16384 21845 49152"
-                elif [ "$MEM_MB" -eq 1024 ]; then MIN_FREE=65536;  SWAP=10; TCP_MEM="49152 65536 131072"
-                else                              MIN_FREE=65536;  SWAP=5;  TCP_MEM="131072 196608 262144"
-                fi
-                ;;
-            3)
-                # 2Gbps — BDP=25MB，缓冲64MB
-                local RMEM=67108864
-                local WMEM=67108864
-                local NOTSENT=524288
-                local ADV_WIN=3
-                if   [ "$MEM_MB" -eq 512 ];  then MIN_FREE=32768;  SWAP=10; TCP_MEM="16384 32768 65536"
-                elif [ "$MEM_MB" -eq 1024 ]; then MIN_FREE=65536;  SWAP=10; TCP_MEM="49152 65536 131072"
-                else                              MIN_FREE=65536;  SWAP=5;  TCP_MEM="131072 196608 393216"
-                fi
-                ;;
+            1) calc_and_apply "$MEM_MB" "$LAT_MS" 500  "$MEM_LABEL" "$LAT_LABEL" "500Mbps"; break ;;
+            2) calc_and_apply "$MEM_MB" "$LAT_MS" 1024 "$MEM_LABEL" "$LAT_LABEL" "1Gbps";   break ;;
+            3) calc_and_apply "$MEM_MB" "$LAT_MS" 2048 "$MEM_LABEL" "$LAT_LABEL" "2Gbps";   break ;;
             0) return ;;
-            *)
-                echo -e "${RED}无效选项${NC}"
-                continue
-                ;;
+            *) echo -e "${RED}无效选项${NC}" ;;
         esac
-
-        local CONFIG
-        CONFIG=$(generate_config "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" "$MIN_FREE" "$SWAP")
-
-        echo ""
-        echo -e "${YELLOW}即将应用配置：${NC}"
-        echo -e "  内存：${MEM_LABEL}"
-        echo -e "  带宽：$([ "$BW_CHOICE" = "1" ] && echo "500Mbps" || [ "$BW_CHOICE" = "2" ] && echo "1Gbps" || echo "2Gbps")"
-        echo -e "  rmem/wmem max：$((RMEM/1024/1024))MB"
-        echo -e "  min_free_kbytes：${MIN_FREE}"
-        echo -e "  tcp_mem：${TCP_MEM}"
-        echo ""
-        read -rp "确认应用？[y/N]：" CONFIRM
-        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-            apply_sysctl "$CONFIG"
-            echo ""
-            echo -e "${GREEN}✓ BBR TCP 调优配置完成${NC}"
-            echo -e "${YELLOW}提示：建议配合限速设置使用，避免 Retr 爆炸${NC}"
-        else
-            echo -e "${YELLOW}已取消${NC}"
-        fi
-        break
     done
 }
+
+# ============================================================
+# BBR 菜单 — 延迟选择
+# ============================================================
+
+menu_bbr_latency() {
+    local MEM_MB=$1
+    local MEM_LABEL=$2
+
+    while true; do
+        echo ""
+        echo -e "${BOLD}内存：${MEM_LABEL} — 请选择网络延迟${NC}"
+        echo ""
+        echo -e "  ${BOLD}1.${NC} 100ms 以内   （国内/亚洲近距离）"
+        echo -e "  ${BOLD}2.${NC} 100ms - 200ms（跨国，如美西→中国）"
+        echo -e "  ${BOLD}3.${NC} 200ms 以上   （欧洲→中国/长距离）"
+        echo -e "  ${BOLD}0.${NC} 返回上级"
+        echo ""
+        read -rp "请选择 [0-3]：" LAT_CHOICE
+
+        case $LAT_CHOICE in
+            1) menu_bbr_bandwidth "$MEM_MB" 50  "$MEM_LABEL" "100ms以内";   break ;;
+            2) menu_bbr_bandwidth "$MEM_MB" 150 "$MEM_LABEL" "100-200ms";   break ;;
+            3) menu_bbr_bandwidth "$MEM_MB" 250 "$MEM_LABEL" "200ms以上";   break ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}" ;;
+        esac
+    done
+}
+
+# ============================================================
+# BBR 菜单 — 内存选择
+# ============================================================
 
 menu_bbr() {
     while true; do
@@ -276,9 +319,9 @@ menu_bbr() {
         read -rp "请选择 [0-3]：" MEM_CHOICE
 
         case $MEM_CHOICE in
-            1) menu_bbr_bandwidth 512  "512 MB"; break ;;
-            2) menu_bbr_bandwidth 1024 "1 GB";   break ;;
-            3) menu_bbr_bandwidth 2048 "2 GB";   break ;;
+            1) menu_bbr_latency 512  "512MB"; break ;;
+            2) menu_bbr_latency 1024 "1GB";   break ;;
+            3) menu_bbr_latency 2048 "2GB";   break ;;
             0) return ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac
