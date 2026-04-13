@@ -258,17 +258,19 @@ menu_bbr_bandwidth() {
         echo ""
         echo -e "${BOLD}内存：${MEM_LABEL}  延迟：${LAT_LABEL} — 请选择带宽${NC}"
         echo ""
-        echo -e "  ${BOLD}1.${NC} 500 Mbps"
-        echo -e "  ${BOLD}2.${NC} 1 Gbps  (1024 Mbps)"
-        echo -e "  ${BOLD}3.${NC} 2 Gbps  (2048 Mbps)"
+        echo -e "  ${BOLD}1.${NC} 200 Mbps"
+        echo -e "  ${BOLD}2.${NC} 500 Mbps"
+        echo -e "  ${BOLD}3.${NC} 1 Gbps  (1024 Mbps)"
+        echo -e "  ${BOLD}4.${NC} 2 Gbps  (2048 Mbps)"
         echo -e "  ${BOLD}0.${NC} 返回上级"
         echo ""
-        read -rp "请选择 [0-3]：" BW_CHOICE
+        read -rp "请选择 [0-4]：" BW_CHOICE
 
         case $BW_CHOICE in
-            1) calc_and_apply "$MEM_MB" "$LAT_MS" 500  "$MEM_LABEL" "$LAT_LABEL" "500Mbps"; break ;;
-            2) calc_and_apply "$MEM_MB" "$LAT_MS" 1024 "$MEM_LABEL" "$LAT_LABEL" "1Gbps";   break ;;
-            3) calc_and_apply "$MEM_MB" "$LAT_MS" 2048 "$MEM_LABEL" "$LAT_LABEL" "2Gbps";   break ;;
+            1) calc_and_apply "$MEM_MB" "$LAT_MS" 200  "$MEM_LABEL" "$LAT_LABEL" "200Mbps"; break ;;
+            2) calc_and_apply "$MEM_MB" "$LAT_MS" 500  "$MEM_LABEL" "$LAT_LABEL" "500Mbps"; break ;;
+            3) calc_and_apply "$MEM_MB" "$LAT_MS" 1024 "$MEM_LABEL" "$LAT_LABEL" "1Gbps";   break ;;
+            4) calc_and_apply "$MEM_MB" "$LAT_MS" 2048 "$MEM_LABEL" "$LAT_LABEL" "2Gbps";   break ;;
             0) return ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac
