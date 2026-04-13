@@ -40,6 +40,8 @@ print_current_status() {
 
 apply_sysctl() {
     local config="$1"
+    rm -f "$SYSCTL_FILE"
+    echo -e "${GREEN}✓ 旧配置已删除${NC}"
     echo "$config" > "$SYSCTL_FILE"
     sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
     echo -e "${GREEN}✓ sysctl 配置已应用${NC}"
