@@ -30,11 +30,13 @@ print_current_status() {
     CURRENT_RATE=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oP 'maxrate \K\S+' || echo "未设置")
     CURRENT_BBR=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     CURRENT_RMEM=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
+    CURRENT_CWND=$(ip route show | grep "^default" | grep -oP 'initcwnd \K\d+' || echo "10（默认）")
     echo -e "${YELLOW}当前状态：${NC}"
     echo -e "  网卡：${DEV}"
     echo -e "  拥塞控制：${CURRENT_BBR}"
     echo -e "  rmem_max：${CURRENT_RMEM}"
     echo -e "  tc 限速：${CURRENT_RATE}"
+    echo -e "  initcwnd：${CURRENT_CWND}"
     echo ""
 }
 
@@ -370,6 +372,75 @@ menu_tc() {
 }
 
 # ============================================================
+# initcwnd 菜单
+# ============================================================
+
+menu_initcwnd() {
+    local DEV GW ONLINK
+    DEV=$(ip route | awk '/^default/{print $5}')
+    GW=$(ip route | awk '/^default/{print $3}')
+    ONLINK=$(ip route | grep "^default" | grep -q "onlink" && echo "onlink" || echo "")
+    local CURRENT
+    CURRENT=$(ip route show | grep "^default" | grep -oP 'initcwnd \K\d+' || echo "10")
+    local SERVICE_CWND="/etc/systemd/system/initcwnd.service"
+
+    echo ""
+    echo -e "${BOLD}initcwnd 设置${NC}"
+    echo -e "网卡：${DEV}　网关：${GW}　当前 initcwnd：${CURRENT}"
+    echo ""
+    echo -e "  推荐值参考："
+    echo -e "    10  = 默认值，保守稳定"
+    echo -e "    50  = 跨国高延迟推荐"
+    echo -e "    100 = 激进，可能引发丢包"
+    echo ""
+    echo -e "  输入 0 恢复默认值（10）"
+    echo ""
+    read -rp "请输入 initcwnd 值（留空使用 50）：" NEW_VAL
+
+    NEW_VAL=${NEW_VAL:-50}
+
+    if ! [[ "$NEW_VAL" =~ ^[0-9]+$ ]] || [ "$NEW_VAL" -lt 0 ] || [ "$NEW_VAL" -gt 1000 ]; then
+        echo -e "${RED}错误：请输入 0-1000 之间的整数${NC}"
+        return
+    fi
+
+    if [ "$NEW_VAL" = "0" ]; then
+        NEW_VAL=10
+    fi
+
+    ip route change default via "$GW" dev "$DEV" $ONLINK initcwnd "$NEW_VAL" initrwnd "$NEW_VAL"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}错误：ip route change 失败${NC}"
+        return
+    fi
+
+    cat > "$SERVICE_CWND" << EOF
+[Unit]
+Description=Set TCP initcwnd
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'GW=\$(ip route | awk '"'"'/^default/{print \$3}'"'"'); DEV=\$(ip route | awk '"'"'/^default/{print \$5}'"'"'); ONLINK=\$(ip route | grep "^default" | grep -q "onlink" && echo "onlink" || echo ""); ip route change default via \$GW dev \$DEV \$ONLINK initcwnd ${NEW_VAL} initrwnd ${NEW_VAL}'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable initcwnd &>/dev/null
+    systemctl restart initcwnd
+
+    local APPLIED
+    APPLIED=$(ip route show | grep "^default" | grep -oP 'initcwnd \K\d+' || echo "未检测到")
+    echo ""
+    echo -e "${GREEN}✓ initcwnd 已设置为：${APPLIED}${NC}"
+    echo -e "${GREEN}✓ 已写入 systemd，重启后自动生效${NC}"
+}
+
+# ============================================================
 # 主菜单
 # ============================================================
 
@@ -382,9 +453,10 @@ main() {
         echo ""
         echo -e "  ${BOLD}1.${NC} BBR TCP 调优"
         echo -e "  ${BOLD}2.${NC} 限速设置"
+        echo -e "  ${BOLD}3.${NC} initcwnd 设置"
         echo -e "  ${BOLD}0.${NC} 退出"
         echo ""
-        read -rp "请选择 [0-2]：" MAIN_CHOICE
+        read -rp "请选择 [0-3]：" MAIN_CHOICE
 
         case $MAIN_CHOICE in
             1)
@@ -394,6 +466,11 @@ main() {
                 ;;
             2)
                 menu_tc
+                echo ""
+                print_current_status
+                ;;
+            3)
+                menu_initcwnd
                 echo ""
                 print_current_status
                 ;;
