@@ -190,9 +190,10 @@ calc_and_apply() {
 
     # BDP = 带宽(MB/s) × RTT(s)
     # 缓冲 = BDP × 1.5，向上取整到常用值
-    local BW_MBS=$(( BW_MBPS / 8 ))
-    local BDP_KB=$(( BW_MBS * LAT_MS / 1000 ))   # KB
-    local BUF_KB=$(( BDP_KB * 3 / 2 ))
+    local BW_MBS BDP_KB BUF_KB
+    BW_MBS=$(( BW_MBPS / 8 ))
+    BDP_KB=$(( BW_MBS * LAT_MS / 1000 ))   # KB
+    BUF_KB=$(( BDP_KB * 3 / 2 ))
 
     # 根据 BDP 选择缓冲区大小（MB）
     local RMEM WMEM ADV_WIN NOTSENT TCP_RMEM_DEFAULT
@@ -204,10 +205,10 @@ calc_and_apply() {
     fi
 
     # 内存相关参数
-    local MIN_FREE SWAP TCP_MEM
+    local MIN_FREE SWAP TCP_MEM TCP_HARD
     if [ "$MEM_MB" -eq 512 ]; then
         MIN_FREE=32768; SWAP=10
-        local TCP_HARD=$(( MEM_MB * 1024 / 4 / 4 ))  # 25% of mem in pages
+        TCP_HARD=$(( MEM_MB * 1024 / 4 / 4 ))  # 25% of mem in pages
         TCP_MEM="$(( TCP_HARD/4 )) $(( TCP_HARD/3 )) ${TCP_HARD}"
     elif [ "$MEM_MB" -eq 1024 ]; then
         MIN_FREE=65536; SWAP=10
@@ -217,8 +218,9 @@ calc_and_apply() {
         TCP_MEM="131072 196608 393216"
     fi
 
-    local BUF_MB=$(( (RMEM + 524288) / 1048576 ))
-    local BDP_MB=$(( (BDP_KB + 512) / 1024 ))
+    local BUF_MB BDP_MB
+    BUF_MB=$(( (RMEM + 524288) / 1048576 ))
+    BDP_MB=$(( (BDP_KB + 512) / 1024 ))
 
     echo ""
     echo -e "${YELLOW}配置摘要：${NC}"
