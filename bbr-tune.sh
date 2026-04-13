@@ -188,20 +188,19 @@ calc_and_apply() {
     local LAT_LABEL=$5
     local BW_LABEL=$6
 
-    # BDP = 带宽(MB/s) × RTT(s)
-    # 缓冲 = BDP × 1.5，向上取整到常用值
-    local BW_MBS BDP_KB BUF_KB
+    # BDP = 带宽(MB/s) × RTT(s)，单位 MB
+    local BW_MBS BDP_MB BUF_MB_CALC
     BW_MBS=$(( BW_MBPS / 8 ))
-    BDP_KB=$(( BW_MBS * LAT_MS / 1000 ))   # KB
-    BUF_KB=$(( BDP_KB * 3 / 2 ))
+    BDP_MB=$(( BW_MBS * LAT_MS / 1000 ))
+    BUF_MB_CALC=$(( BDP_MB * 3 / 2 ))
 
     # 根据 BDP 选择缓冲区大小（MB）
     local RMEM WMEM ADV_WIN NOTSENT TCP_RMEM_DEFAULT
-    if   [ "$BUF_KB" -le 10240  ]; then RMEM=12582912;  WMEM=12582912;  ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_KB" -le 20480  ]; then RMEM=20971520;  WMEM=20971520;  ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_KB" -le 40960  ]; then RMEM=41943040;  WMEM=41943040;  ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=4194304
-    elif [ "$BUF_KB" -le 65536  ]; then RMEM=67108864;  WMEM=67108864;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=4194304
-    else                                RMEM=134217728; WMEM=134217728; ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=4194304
+    if   [ "$BUF_MB_CALC" -le 10  ]; then RMEM=12582912;  WMEM=12582912;  ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_MB_CALC" -le 20  ]; then RMEM=20971520;  WMEM=20971520;  ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_MB_CALC" -le 40  ]; then RMEM=41943040;  WMEM=41943040;  ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=4194304
+    elif [ "$BUF_MB_CALC" -le 64  ]; then RMEM=67108864;  WMEM=67108864;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=4194304
+    else                                   RMEM=134217728; WMEM=134217728; ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=4194304
     fi
 
     # 内存相关参数
@@ -218,9 +217,8 @@ calc_and_apply() {
         TCP_MEM="131072 196608 393216"
     fi
 
-    local BUF_MB BDP_MB
-    BUF_MB=$(( (RMEM + 524288) / 1048576 ))
-    BDP_MB=$(( (BDP_KB + 512) / 1024 ))
+    local BUF_MB
+    BUF_MB=$(( RMEM / 1048576 ))
 
     echo ""
     echo -e "${YELLOW}配置摘要：${NC}"
