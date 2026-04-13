@@ -11,7 +11,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 SERVICE_TC="/etc/systemd/system/tc-fq.service"
-SYSCTL_FILE="/etc/sysctl.d/99-tuning.conf"
+SYSCTL_FILE="/etc/sysctl.conf"
 
 # ============================================================
 # 工具函数
