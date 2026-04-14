@@ -40,6 +40,58 @@ print_current_status() {
     echo ""
 }
 
+backup_sysctl() {
+    if [ -f "$SYSCTL_FILE" ]; then
+        local BACKUP="${SYSCTL_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$SYSCTL_FILE" "$BACKUP"
+        echo -e "${GREEN}✓ 已备份至：${BACKUP}${NC}"
+    else
+        echo -e "${YELLOW}提示：未找到现有配置文件，跳过备份${NC}"
+    fi
+}
+
+restore_sysctl() {
+    echo ""
+    echo -e "${BOLD}还原 sysctl.conf — 选择备份文件${NC}"
+    echo ""
+    local BACKUPS
+    mapfile -t BACKUPS < <(ls -t "${SYSCTL_FILE}.bak."* 2>/dev/null)
+    if [ ${#BACKUPS[@]} -eq 0 ]; then
+        echo -e "${YELLOW}未找到任何备份文件${NC}"
+        return
+    fi
+    local i=1
+    for f in "${BACKUPS[@]}"; do
+        echo -e "  ${BOLD}${i}.${NC} $(basename "$f")  $(stat -c '%y' "$f" | cut -d'.' -f1)"
+        (( i++ ))
+    done
+    echo -e "  ${BOLD}d.${NC} 清除全部备份"
+    echo -e "  ${BOLD}0.${NC} 返回"
+    echo ""
+    read -rp "请选择 [0-$((i-1))/d]：" RESTORE_CHOICE
+
+    if [ "$RESTORE_CHOICE" = "0" ]; then
+        return
+    elif [ "$RESTORE_CHOICE" = "d" ] || [ "$RESTORE_CHOICE" = "D" ]; then
+        read -rp "确认清除全部 ${#BACKUPS[@]} 个备份？[y/N]：" CONFIRM_DEL
+        if [[ "$CONFIRM_DEL" =~ ^[Yy]$ ]]; then
+            rm -f "${SYSCTL_FILE}.bak."*
+            echo -e "${GREEN}✓ 已清除全部备份${NC}"
+        else
+            echo -e "${YELLOW}已取消${NC}"
+        fi
+        return
+    elif ! [[ "$RESTORE_CHOICE" =~ ^[0-9]+$ ]] || [ "$RESTORE_CHOICE" -lt 1 ] || [ "$RESTORE_CHOICE" -gt ${#BACKUPS[@]} ]; then
+        echo -e "${RED}无效选项${NC}"
+        return
+    fi
+    local TARGET="${BACKUPS[$((RESTORE_CHOICE-1))]}"
+    cp "$TARGET" "$SYSCTL_FILE"
+    sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
+    echo -e "${GREEN}✓ 已还原：$(basename "$TARGET")${NC}"
+    echo -e "${GREEN}✓ sysctl 已重新加载${NC}"
+}
+
 apply_sysctl() {
     local config="$1"
     rm -f "$SYSCTL_FILE"
@@ -202,9 +254,9 @@ calc_and_apply() {
     local RMEM WMEM ADV_WIN NOTSENT TCP_RMEM_DEFAULT
     if   [ "$BUF_MB_CALC" -le 10  ]; then RMEM=12582912;  WMEM=12582912;  ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
     elif [ "$BUF_MB_CALC" -le 20  ]; then RMEM=20971520;  WMEM=20971520;  ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_MB_CALC" -le 40  ]; then RMEM=41943040;  WMEM=41943040;  ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_MB_CALC" -le 64  ]; then RMEM=67108864;  WMEM=67108864;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=1048576
-    else                                   RMEM=134217728; WMEM=134217728; ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=2097152
+    elif [ "$BUF_MB_CALC" -le 40  ]; then RMEM=41943040;  WMEM=41943040;  ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=4194304
+    elif [ "$BUF_MB_CALC" -le 64  ]; then RMEM=67108864;  WMEM=67108864;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=4194304
+    else                                   RMEM=134217728; WMEM=134217728; ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=4194304
     fi
 
     # 内存相关参数
@@ -235,6 +287,13 @@ calc_and_apply() {
     echo ""
     read -rp "确认应用？[y/N]：" CONFIRM
     if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        # 询问是否备份
+        if [ -f "$SYSCTL_FILE" ]; then
+            read -rp "是否备份旧的 sysctl.conf？[Y/n]：" DO_BACKUP
+            if [[ ! "$DO_BACKUP" =~ ^[Nn]$ ]]; then
+                backup_sysctl
+            fi
+        fi
         local CONFIG
         CONFIG=$(generate_config "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT")
         apply_sysctl "$CONFIG"
@@ -320,14 +379,18 @@ menu_bbr() {
         echo -e "  ${BOLD}1.${NC} 512 MB"
         echo -e "  ${BOLD}2.${NC} 1 GB"
         echo -e "  ${BOLD}3.${NC} 2 GB"
+        echo -e "  ${BOLD}8.${NC} 备份当前 sysctl.conf"
+        echo -e "  ${BOLD}9.${NC} 还原旧的 sysctl.conf"
         echo -e "  ${BOLD}0.${NC} 返回主菜单"
         echo ""
-        read -rp "请选择 [0-3]：" MEM_CHOICE
+        read -rp "请选择 [0-3/8/9]：" MEM_CHOICE
 
         case $MEM_CHOICE in
             1) menu_bbr_latency 512  "512MB"; break ;;
             2) menu_bbr_latency 1024 "1GB";   break ;;
             3) menu_bbr_latency 2048 "2GB";   break ;;
+            8) backup_sysctl ;;
+            9) restore_sysctl ;;
             0) return ;;
             *) echo -e "${RED}无效选项${NC}" ;;
         esac
