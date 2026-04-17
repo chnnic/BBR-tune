@@ -27,7 +27,8 @@ print_header() {
 
 print_current_status() {
     DEV=$(ip route | awk '/^default/{print $5}')
-    CURRENT_RATE=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oP 'maxrate \K\S+' || echo "未设置")
+    CURRENT_RATE=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oP '(?:maxrate|rate) \K\S+' | head -1)
+    [ -z "$CURRENT_RATE" ] && CURRENT_RATE="未设置"
     CURRENT_BBR=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     CURRENT_RMEM=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "未知")
     CURRENT_CWND=$(ip route show | grep "^default" | grep -oP 'initcwnd \K\d+' || echo "10（默认）")
@@ -112,25 +113,21 @@ apply_tc() {
     if [ "$IS_MQ" -eq 1 ]; then
         local QUEUES
         QUEUES=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
-        echo -e "  检测到 mq 多队列网卡，队列数：${QUEUES}"
-        local i=1
-        while [ "$i" -le "$QUEUES" ]; do
-            # 子队列已存在 fq 用 change，否则用 replace
-            if tc qdisc show dev "$DEV" parent ":${i}" 2>/dev/null | grep -q "fq"; then
-                tc qdisc change dev "$DEV" parent ":${i}" fq maxrate "${rate}mbit"
-            else
-                tc qdisc replace dev "$DEV" parent ":${i}" fq maxrate "${rate}mbit"
-            fi
-            (( i++ ))
-        done
-        # 生成 systemd service（多行 ExecStart）
-        local SVC_BODY=""
-        i=1
-        while [ "$i" -le "$QUEUES" ]; do
-            SVC_BODY="${SVC_BODY}ExecStart=/sbin/tc qdisc replace dev ${DEV} parent :${i} fq maxrate ${rate}mbit\n"
-            (( i++ ))
-        done
-        printf "[Unit]\nDescription=FQ rate limit\nAfter=network.target\n\n[Service]\nType=oneshot\n%sRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n" "$(echo -e "$SVC_BODY")" > "$SERVICE_TC"
+        echo -e "  检测到 mq 多队列网卡，队列数：${QUEUES}，使用 tbf 限速"
+        tc qdisc replace dev "$DEV" root tbf rate "${rate}mbit" burst "${rate}mbit" latency 50ms
+        cat > "$SERVICE_TC" << EOF
+[Unit]
+Description=FQ rate limit
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/tc qdisc replace dev ${DEV} root tbf rate ${rate}mbit burst ${rate}mbit latency 50ms
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
     else
         tc qdisc replace dev "$DEV" root fq maxrate "${rate}mbit"
         cat > "$SERVICE_TC" << EOF
@@ -438,7 +435,7 @@ menu_tc() {
     local IS_MQ=0
     tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" && IS_MQ=1
     local CURRENT
-    CURRENT=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oP 'maxrate \K\S+' | head -1)
+    CURRENT=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oP '(?:maxrate|rate) \K\S+' | head -1)
     [ -z "$CURRENT" ] && CURRENT="未设置"
 
     echo ""
@@ -457,15 +454,10 @@ menu_tc() {
 
     if [ "$NEW_VAL" = "0" ]; then
         if [ "$IS_MQ" -eq 1 ]; then
-            local QUEUES
-            QUEUES=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
-            local i=1
-            while [ "$i" -le "$QUEUES" ]; do
-                if tc qdisc show dev "$DEV" parent ":${i}" 2>/dev/null | grep -q "fq"; then
-                    tc qdisc change dev "$DEV" parent ":${i}" fq 2>/dev/null
-                fi
-                (( i++ ))
-            done
+            # tbf 替换了 mq，取消限速恢复 mq
+            tc qdisc del dev "$DEV" root 2>/dev/null
+            tc qdisc add dev "$DEV" root mq 2>/dev/null
+            echo -e "${GREEN}✓ 已取消限速，mq 已恢复${NC}"
         else
             tc qdisc del dev "$DEV" root 2>/dev/null
         fi
