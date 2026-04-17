@@ -108,7 +108,9 @@ apply_tc() {
 
     # 检测是否为 mq 多队列网卡
     local IS_MQ=0
-    tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" && IS_MQ=1
+    local TX_QUEUES
+    TX_QUEUES=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
+    { tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" || [ "$TX_QUEUES" -gt 1 ]; } && IS_MQ=1
 
     if [ "$IS_MQ" -eq 1 ]; then
         local QUEUES
@@ -431,9 +433,11 @@ menu_bbr() {
 menu_tc() {
     local DEV=$(ip route | awk '/^default/{print $5}')
 
-    # 检测 mq 或普通网卡
+    # 检测 mq 或普通网卡：mq 存在 或 有多个 tx 队列
     local IS_MQ=0
-    tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" && IS_MQ=1
+    local TX_QUEUES
+    TX_QUEUES=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
+    { tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" || [ "$TX_QUEUES" -gt 1 ]; } && IS_MQ=1
     local CURRENT
     CURRENT=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oP '(?:maxrate|rate) \K\S+' | head -1)
     [ -z "$CURRENT" ] && CURRENT="未设置"
