@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# BBR TCP 调优 + 限速设置 一体化脚本
+# BBR TCP 调优 + 限速设置 一体化脚本  Ver 0.12
 # ============================================================
 
 RED='\033[0;31m'
@@ -104,8 +104,31 @@ apply_sysctl() {
 apply_tc() {
     local rate="$1"
     local DEV=$(ip route | awk '/^default/{print $5}')
-    tc qdisc replace dev "$DEV" root fq maxrate "${rate}mbit"
-    cat > "$SERVICE_TC" << EOF
+
+    # 检测是否为 mq 多队列网卡
+    local IS_MQ=0
+    tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" && IS_MQ=1
+
+    if [ "$IS_MQ" -eq 1 ]; then
+        local QUEUES
+        QUEUES=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
+        echo -e "  检测到 mq 多队列网卡，队列数：${QUEUES}"
+        local i=1
+        while [ "$i" -le "$QUEUES" ]; do
+            tc qdisc replace dev "$DEV" parent ":${i}" fq maxrate "${rate}mbit"
+            (( i++ ))
+        done
+        # 生成 systemd service（多行 ExecStart）
+        local SVC_BODY=""
+        i=1
+        while [ "$i" -le "$QUEUES" ]; do
+            SVC_BODY="${SVC_BODY}ExecStart=/sbin/tc qdisc replace dev ${DEV} parent :${i} fq maxrate ${rate}mbit\n"
+            (( i++ ))
+        done
+        printf "[Unit]\nDescription=FQ rate limit\nAfter=network.target\n\n[Service]\nType=oneshot\n%sRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n" "$(echo -e "$SVC_BODY")" > "$SERVICE_TC"
+    else
+        tc qdisc replace dev "$DEV" root fq maxrate "${rate}mbit"
+        cat > "$SERVICE_TC" << EOF
 [Unit]
 Description=FQ rate limit
 After=network.target
@@ -118,6 +141,8 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+    fi
+
     systemctl daemon-reload
     systemctl enable tc-fq &>/dev/null
     systemctl restart tc-fq
@@ -403,11 +428,17 @@ menu_bbr() {
 
 menu_tc() {
     local DEV=$(ip route | awk '/^default/{print $5}')
-    local CURRENT=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oP 'maxrate \K\S+' || echo "未设置")
+
+    # 检测 mq 或普通网卡
+    local IS_MQ=0
+    tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" && IS_MQ=1
+    local CURRENT
+    CURRENT=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oP 'maxrate \K\S+' | head -1)
+    [ -z "$CURRENT" ] && CURRENT="未设置"
 
     echo ""
     echo -e "${BOLD}限速设置${NC}"
-    echo -e "网卡：${DEV}　当前限速：${CURRENT}"
+    echo -e "网卡：${DEV}　类型：$([ "$IS_MQ" -eq 1 ] && echo "mq 多队列" || echo "单队列")　当前限速：${CURRENT}"
     echo ""
     echo -e "  请输入限速值（单位 Mbps，输入 0 取消限速）"
     echo -e "  常用参考：500  780  1024=1Gbps  2048=2Gbps"
@@ -420,11 +451,21 @@ menu_tc() {
     fi
 
     if [ "$NEW_VAL" = "0" ]; then
-        tc qdisc del dev "$DEV" root 2>/dev/null
+        if [ "$IS_MQ" -eq 1 ]; then
+            local QUEUES
+            QUEUES=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
+            local i=1
+            while [ "$i" -le "$QUEUES" ]; do
+                tc qdisc replace dev "$DEV" parent ":${i}" fq 2>/dev/null
+                (( i++ ))
+            done
+        else
+            tc qdisc del dev "$DEV" root 2>/dev/null
+        fi
         systemctl disable tc-fq &>/dev/null
         rm -f "$SERVICE_TC"
         systemctl daemon-reload
-        echo -e "${GREEN}✓ 已取消限速，tc 规则已删除${NC}"
+        echo -e "${GREEN}✓ 已取消限速${NC}"
     else
         apply_tc "$NEW_VAL"
     fi
