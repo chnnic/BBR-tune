@@ -20,7 +20,7 @@ SYSCTL_FILE="/etc/sysctl.conf"
 print_header() {
     echo ""
     echo -e "${BOLD}${CYAN}============================================================${NC}"
-    echo -e "${BOLD}${CYAN}   BBR TCP 调优 + 限速设置脚本${NC}"
+    echo -e "${BOLD}${CYAN}   BBR TCP 调优 + 限速设置脚本 Ver 0.12${NC}"
     echo -e "${BOLD}${CYAN}============================================================${NC}"
     echo ""
 }
