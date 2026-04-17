@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# BBR TCP 调优 + 限速设置 一体化脚本  Ver 0.12
+# BBR TCP 调优 + 限速设置 一体化脚本
 # ============================================================
 
 RED='\033[0;31m'
@@ -20,7 +20,7 @@ SYSCTL_FILE="/etc/sysctl.conf"
 print_header() {
     echo ""
     echo -e "${BOLD}${CYAN}============================================================${NC}"
-    echo -e "${BOLD}${CYAN}   BBR TCP 调优 + 限速设置脚本 Ver 0.12${NC}"
+    echo -e "${BOLD}${CYAN}   BBR TCP 调优 + 限速设置脚本${NC}"
     echo -e "${BOLD}${CYAN}============================================================${NC}"
     echo ""
 }
@@ -115,7 +115,12 @@ apply_tc() {
         echo -e "  检测到 mq 多队列网卡，队列数：${QUEUES}"
         local i=1
         while [ "$i" -le "$QUEUES" ]; do
-            tc qdisc replace dev "$DEV" parent ":${i}" fq maxrate "${rate}mbit"
+            # 子队列已存在 fq 用 change，否则用 replace
+            if tc qdisc show dev "$DEV" parent ":${i}" 2>/dev/null | grep -q "fq"; then
+                tc qdisc change dev "$DEV" parent ":${i}" fq maxrate "${rate}mbit"
+            else
+                tc qdisc replace dev "$DEV" parent ":${i}" fq maxrate "${rate}mbit"
+            fi
             (( i++ ))
         done
         # 生成 systemd service（多行 ExecStart）
@@ -456,7 +461,9 @@ menu_tc() {
             QUEUES=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
             local i=1
             while [ "$i" -le "$QUEUES" ]; do
-                tc qdisc replace dev "$DEV" parent ":${i}" fq 2>/dev/null
+                if tc qdisc show dev "$DEV" parent ":${i}" 2>/dev/null | grep -q "fq"; then
+                    tc qdisc change dev "$DEV" parent ":${i}" fq 2>/dev/null
+                fi
                 (( i++ ))
             done
         else
