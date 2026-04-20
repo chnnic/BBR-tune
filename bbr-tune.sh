@@ -116,7 +116,7 @@ apply_tc() {
         local QUEUES
         QUEUES=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
         echo -e "  检测到 mq 多队列网卡，队列数：${QUEUES}，使用 tbf 限速"
-        tc qdisc replace dev "$DEV" root tbf rate "${rate}mbit" burst "${rate}mbit" latency 50ms
+        tc qdisc replace dev "$DEV" root tbf rate "${rate}mbit" burst 10mbit latency 50ms
         cat > "$SERVICE_TC" << EOF
 [Unit]
 Description=FQ rate limit
@@ -124,7 +124,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/tc qdisc replace dev ${DEV} root tbf rate ${rate}mbit burst ${rate}mbit latency 50ms
+ExecStart=/sbin/tc qdisc replace dev ${DEV} root tbf rate ${rate}mbit burst 10mbit latency 50ms
 RemainAfterExit=yes
 
 [Install]
