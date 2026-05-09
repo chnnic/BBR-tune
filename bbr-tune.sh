@@ -314,15 +314,15 @@ bbr_confirm_apply() {
     echo -e "  swappiness   : ${BOLD}${SWAP}${NC}"
     echo -e "  ${YELLOW}──────────────────────────────────────────${NC}"
     echo ""
-    read -rp "  确认应用？(Y/n，默认Y): " CONFIRM
-    [ -z "${CONFIRM}" ] && CONFIRM="y"
-    if ! echo "${CONFIRM}" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
-
     if [ -f "$SYSCTL_FILE" ]; then
-        read -rp "  是否备份旧的 sysctl.conf？(Y/n，默认Y): " DO_BAK
+        read -rp "  备份当前 sysctl 配置？(Y/n，默认Y): " DO_BAK
         [ -z "$DO_BAK" ] && DO_BAK="y"
         echo "$DO_BAK" | grep -qiE '^y(es)?$' && bbr_backup_sysctl
+        echo ""
     fi
+    read -rp "  确认应用以上配置？(Y/n，默认Y): " CONFIRM
+    [ -z "${CONFIRM}" ] && CONFIRM="y"
+    if ! echo "${CONFIRM}" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
 
     local CONFIG
     CONFIG=$(bbr_generate_config "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT")
