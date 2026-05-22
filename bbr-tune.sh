@@ -2,10 +2,11 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本 V3.0.0 独立提取
-#  用法：bash bbr-tcp.sh
+#  从 VPS 开荒脚本独立提取（基于 V3.4.1）
+#  用法：bash bbr-tune.sh
 # ============================================================
 
+# ── 颜色定义 ──────────────────────────────────────────────
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
 YELLOW=$'\033[1;33m'
@@ -15,16 +16,19 @@ BOLD=$'\033[1m'
 DIM=$'\033[2m'
 NC=$'\033[0m'
 
+# ── 提示函数 ──────────────────────────────────────────────
 info()  { echo -e "  ${GREEN}✔${NC}  $1"; }
 warn()  { echo -e "  ${YELLOW}⚠${NC}  $1"; }
 error() { echo -e "  ${RED}✘${NC}  $1"; }
 
+# ── 终端兼容 ──────────────────────────────────────────────
 safe_clear() {
     if [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
         clear 2>/dev/null || true
     fi
 }
 
+# ── 字符长度（中文按 2，英文按 1）─────────────────────────
 vis_len() {
     python3 -c "
 import unicodedata, sys
@@ -33,6 +37,7 @@ print(sum(2 if unicodedata.east_asian_width(c) in ('W','F') else 1 for c in s))
 " "$1" 2>/dev/null || echo "${#1}"
 }
 
+# ── 框线绘制 ──────────────────────────────────────────────
 BOX_W=42
 box_top() { printf "${CYAN}"; printf '═%.0s' $(seq 1 $((BOX_W-2))); printf "${NC}\n"; }
 box_bot() { printf "${CYAN}"; printf '═%.0s' $(seq 1 $((BOX_W-2))); printf "${NC}\n"; }
@@ -55,6 +60,7 @@ box_line() {
     echo -e "$COLORED"
 }
 
+# ── 标准标题栏 ────────────────────────────────────────────
 print_header() {
     safe_clear
     echo ""
@@ -67,12 +73,13 @@ print_header() {
     echo ""
 }
 
-# 权限检查
+# ── root 检查 ─────────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[ERROR]${NC} 请使用 root 权限运行：sudo bash $0"
     exit 1
 fi
 
+# ── 包管理器 ──────────────────────────────────────────────
 pkg_install() {
     local PKG="$1"
     if command -v apt-get &>/dev/null; then
@@ -88,29 +95,27 @@ pkg_install() {
     fi
 }
 
-svc_enable() {
-    local SVC="$1"
-    if command -v systemctl &>/dev/null && pidof systemd &>/dev/null; then
-        systemctl unmask "$SVC" 2>/dev/null || true
-        systemctl enable "$SVC" --quiet 2>/dev/null || true
-    elif command -v rc-update &>/dev/null; then
-        rc-update add "$SVC" default 2>/dev/null
+# ── 编辑器自动选择 ────────────────────────────────────────
+get_editor() {
+    for ed in nano vi vim; do
+        command -v "$ed" &>/dev/null && echo "$ed" && return
+    done
+    echo "vi"
+}
+
+# ── sysctl 可用性 ─────────────────────────────────────────
+ensure_sysctl() {
+    command -v sysctl &>/dev/null && return 0
+    warn "sysctl 未找到，正在安装..."
+    if command -v apk &>/dev/null; then
+        apk add --no-cache procps 2>/dev/null || true
+    else
+        pkg_install procps 2>/dev/null || true
     fi
+    command -v sysctl &>/dev/null
 }
 
-svc_disable() {
-    local SVC="$1"
-    if command -v systemctl &>/dev/null; then
-        systemctl disable "$SVC" --quiet 2>/dev/null
-    elif command -v rc-update &>/dev/null; then
-        rc-update del "$SVC" 2>/dev/null
-    fi
-}
-
-svc_daemon_reload() {
-    command -v systemctl &>/dev/null && systemctl daemon-reload 2>/dev/null || true
-}
-
+# ── 容器检测 ──────────────────────────────────────────────
 is_openvz() {
     [ -f /proc/vz/veinfo ] && return 0
     grep -qaE 'openvz|lxc' /proc/1/environ 2>/dev/null && return 0
@@ -123,6 +128,11 @@ is_lxc() {
     || [ -f /run/systemd/container ] \
     || grep -qa "container=lxc" /proc/1/environ 2>/dev/null \
     || { [ -f /proc/1/cgroup ] && grep -qa "lxc" /proc/1/cgroup 2>/dev/null; }
+}
+
+has_sysctl_write() {
+    sysctl -w net.ipv4.tcp_fin_timeout=10 > /dev/null 2>&1 && return 0
+    return 1
 }
 
 # ══════════════════════════════════════════════════════════
@@ -138,7 +148,9 @@ bbr_print_status() {
     local RATE; RATE=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oE '(maxrate|rate) [^ ]+' | head -1 | awk '{print $2}')
     [ -z "$RATE" ] && RATE="未设置"
     local BBR; BBR=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-    local CWND; CWND=$(ip route show | grep "^default" | grep -oE 'initcwnd [0-9]+' | awk '{print $2}' || echo "10")
+    local CWND
+    CWND=$(ip route show 2>/dev/null | grep "^default" | grep -oE 'initcwnd [0-9]+' | awk '{print $2}')
+    [ -z "$CWND" ] && CWND="10（默认）"
 
     # 读取缓冲区大小
     local RMEM_MAX WMEM_MAX RMEM_MB WMEM_MB
@@ -154,8 +166,18 @@ bbr_print_status() {
     TCP_RMEM_MB=$(( ${TCP_RMEM_MAX:-0} / 1048576 ))
     TCP_WMEM_MB=$(( ${TCP_WMEM_MAX:-0} / 1048576 ))
 
-    echo -e "  网卡 ${BOLD}$DEV${NC}  |  拥塞控制 ${BOLD}$BBR${NC}  |  限速 ${BOLD}$RATE${NC}  |  initcwnd ${BOLD}$CWND${NC}"
-    echo -e "  rmem_max ${BOLD}${RMEM_MB}MB${NC}  |  wmem_max ${BOLD}${WMEM_MB}MB${NC}  |  tcp_rmem max ${BOLD}${TCP_RMEM_MB}MB${NC}  |  tcp_wmem max ${BOLD}${TCP_WMEM_MB}MB${NC}"
+    echo -e "  ${CYAN}网卡${NC} ${BOLD}$DEV${NC}  ${CYAN}CC${NC} ${BOLD}$BBR${NC}  ${CYAN}cwnd${NC} ${BOLD}$CWND${NC}  ${CYAN}限速${NC} ${BOLD}$RATE${NC}"
+    # 检测缓冲区是否超过物理内存一半（显示警告）
+    local MEM_TOTAL_MB
+    MEM_TOTAL_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
+    local RMEM_COLOR WMEM_COLOR
+    RMEM_COLOR="$BOLD"
+    WMEM_COLOR="$BOLD"
+    if [ "${MEM_TOTAL_MB:-0}" -gt 0 ]; then
+        [ "$RMEM_MB" -gt $(( MEM_TOTAL_MB / 2 )) ] && RMEM_COLOR="${YELLOW}${BOLD}"
+        [ "$WMEM_MB" -gt $(( MEM_TOTAL_MB / 2 )) ] && WMEM_COLOR="${YELLOW}${BOLD}"
+    fi
+    echo -e "  ${CYAN}缓冲${NC} rmem ${RMEM_COLOR}${RMEM_MB}MB${NC}  wmem ${WMEM_COLOR}${WMEM_MB}MB${NC}  tcp_r ${BOLD}${TCP_RMEM_MB}MB${NC}  tcp_w ${BOLD}${TCP_WMEM_MB}MB${NC}  ${DIM}物理内存 ${MEM_TOTAL_MB}MB${NC}"
 }
 
 # ── 备份 sysctl ───────────────────────────────────────────
@@ -169,49 +191,86 @@ bbr_backup_sysctl() {
 
 # ── 还原 sysctl ───────────────────────────────────────────
 bbr_restore_sysctl() {
-    print_header "还原 sysctl.conf"
-    local BACKUPS=()
-    local BACKUPS=()
-    while IFS= read -r _bline; do BACKUPS+=("$_bline"); done < <(ls -t "${SYSCTL_FILE}.bak."* 2>/dev/null)
-    if [ ${#BACKUPS[@]} -eq 0 ]; then
+    print_header "还原 TCP sysctl 配置"
+
+    # 用 /tmp 临时文件列表替代 bash 数组（兼容 Alpine ash）
+    local LIST_FILE="/tmp/vps_bbr_bak_$$"
+    ls -t "${SYSCTL_FILE}.bak."* 2>/dev/null > "$LIST_FILE"
+
+    if [ ! -s "$LIST_FILE" ]; then
+        rm -f "$LIST_FILE"
         warn "未找到任何备份文件"
         return
     fi
+
     local i=1
-    for f in "${BACKUPS[@]}"; do
-        echo -e "  ${GREEN}[$i]${NC} $(basename "$f")  $(stat -c '%y' "$f" | cut -d'.' -f1)"
-        (( i++ ))
-    done
+    while IFS= read -r f; do
+        # stat 兼容：BusyBox stat 用 -c '%y'，但格式有差异，改用 ls -l 更通用
+        local FDATE
+        FDATE=$(ls -l "$f" 2>/dev/null | awk '{print $6, $7}')
+        echo -e "  ${GREEN}[$i]${NC} $(basename "$f")  ${DIM}${FDATE}${NC}"
+        i=$(( i + 1 ))
+    done < "$LIST_FILE"
+
+    local TOTAL=$(( i - 1 ))
     echo -e "  ${YELLOW}[d]${NC} 清除全部备份"
     echo -e "  ${RED}[0]${NC} 返回"
     echo ""
     read -rp "  请选择: " CH
+
     case "$CH" in
-        0) return ;;
-        00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
+        0) rm -f "$LIST_FILE"; return ;;
+        00) rm -f "$LIST_FILE"; safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         d|D)
-            read -rp "  确认清除全部 ${#BACKUPS[@]} 个备份？(Y/n，默认Y): " C
-            [ "$C" = "yes" ] && rm -f "${SYSCTL_FILE}.bak."* && info "已清除全部备份" || warn "已取消"
+            read -rp "  确认清除全部 ${TOTAL} 个备份？(Y/n，默认Y): " C
+            [ -z "$C" ] && C="y"
+            if echo "$C" | grep -qiE '^y(es)?$'; then
+                rm -f "${SYSCTL_FILE}.bak."*
+                info "已清除全部备份 ✓"
+            else
+                warn "已取消"
+            fi
             ;;
         *)
-            if [[ "$CH" =~ ^[0-9]+$ ]] && [ "$CH" -ge 1 ] && [ "$CH" -le ${#BACKUPS[@]} ]; then
-                local T="${BACKUPS[$((CH-1))]}"
+            # 纯数字且在范围内
+            if echo "$CH" | grep -qE '^[0-9]+$' && [ "$CH" -ge 1 ] && [ "$CH" -le "$TOTAL" ]; then
+                local T
+                T=$(sed -n "${CH}p" "$LIST_FILE")
                 cp "$T" "$SYSCTL_FILE"
-                sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
+                ensure_sysctl && sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
                 info "已还原：$(basename "$T") ✓"
             else
                 error "无效选项"
             fi
             ;;
     esac
+    rm -f "$LIST_FILE"
 }
 
 # ── 应用 sysctl ───────────────────────────────────────────
 bbr_apply_sysctl() {
     local CONFIG="$1"
+    ensure_sysctl || return 1
     mkdir -p "$(dirname "$SYSCTL_FILE")" 2>/dev/null || true
     echo "$CONFIG" > "$SYSCTL_FILE"
-    sysctl -p "$SYSCTL_FILE" > /dev/null 2>&1
+
+    # 逐行应用，跳过不支持的参数（Alpine 部分内核不支持 default_qdisc 等）
+    local FAILED=0 SKIPPED=0
+    while IFS= read -r line; do
+        # 跳过注释和空行
+        echo "$line" | grep -qE '^\s*#|^\s*$' && continue
+        local KEY VAL
+        KEY=$(echo "$line" | cut -d= -f1 | tr -d ' ')
+        VAL=$(echo "$line" | cut -d= -f2- | sed 's/^ //')
+        if ! sysctl -w "${KEY}=${VAL}" > /dev/null 2>&1; then
+            warn "跳过不支持的参数：${KEY}"
+            SKIPPED=$(( SKIPPED + 1 ))
+        fi
+    done < "$SYSCTL_FILE"
+
+    if [ "$SKIPPED" -gt 0 ]; then
+        warn "共跳过 ${SKIPPED} 个不支持的参数（已记录在配置文件，重启后不影响）"
+    fi
     info "sysctl 配置已应用到 ${SYSCTL_FILE} ✓"
 }
 
@@ -219,7 +278,7 @@ bbr_apply_sysctl() {
 bbr_apply_tc() {
     local RATE="$1"
     local DEV; DEV=$(ip route | awk '/^default/{print $5}')
-    local TX_Q; TX_Q=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
+    local TX_Q; TX_Q=$(find /sys/class/net/"$DEV"/queues/ -maxdepth 1 -name "tx-*" 2>/dev/null | wc -l)
     local IS_MQ=0
     { tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" || [ "$TX_Q" -gt 1 ]; } && IS_MQ=1
 
@@ -262,37 +321,31 @@ bbr_generate_config() {
           MIN_FREE=$6 SWAPPINESS=$7 TCP_RMEM_DEFAULT=$8
     cat << EOF
 # BBR TCP 调优配置 — 生成时间：$(date)
+# ── 内存管理 ──
 vm.swappiness = ${SWAPPINESS}
-vm.dirty_background_ratio = 5
 vm.min_free_kbytes = ${MIN_FREE}
+
+# ── BBR 核心 ──
 net.core.default_qdisc = fq
-net.core.netdev_max_backlog = 8192
-net.core.somaxconn = 8192
+net.ipv4.tcp_congestion_control = bbr
+
+# ── 缓冲区 ──
 net.core.rmem_max = ${RMEM}
 net.core.wmem_max = ${WMEM}
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
 net.ipv4.tcp_rmem = 32768 ${TCP_RMEM_DEFAULT} ${RMEM}
 net.ipv4.tcp_wmem = 32768 ${TCP_RMEM_DEFAULT} ${WMEM}
 net.ipv4.tcp_mem = ${TCP_MEM}
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_adv_win_scale = ${ADV_WIN}
-net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_notsent_lowat = ${NOTSENT}
+
+# ── 连接质量 ──
+net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_ecn = 2
+net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_max_tw_buckets = 32768
-net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.conf.all.arp_announce = 2
-net.ipv4.conf.default.arp_announce = 2
 EOF
 }
 
@@ -314,6 +367,22 @@ bbr_confirm_apply() {
     echo -e "  swappiness   : ${BOLD}${SWAP}${NC}"
     echo -e "  ${YELLOW}──────────────────────────────────────────${NC}"
     echo ""
+    # 先检测 sysctl 写入权限
+    if ! has_sysctl_write; then
+        error "当前容器无 sysctl 写入权限，无法应用配置"
+        echo -e "  ${DIM}需要宿主机开启 privileged 模式或 sysctl 白名单${NC}"
+        return
+    fi
+
+    # 再检测内核是否支持 BBR
+    if ! bbr_check_kernel; then
+        echo ""
+        read -rp "  内核不支持 BBR，仍要继续写入配置？(y/N，默认N): " FORCE
+        [ -z "$FORCE" ] && FORCE="n"
+        if ! echo "$FORCE" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
+    fi
+
+    # 先提示备份（默认Y）
     if [ -f "$SYSCTL_FILE" ]; then
         read -rp "  备份当前 sysctl 配置？(Y/n，默认Y): " DO_BAK
         [ -z "$DO_BAK" ] && DO_BAK="y"
@@ -341,17 +410,30 @@ bbr_auto_calc() {
     local BUF_CALC=$(( BDP_MB * 3 / 2 ))
 
     local RMEM WMEM ADV_WIN NOTSENT TCP_RMEM_DEFAULT
-    if   [ "$BUF_CALC" -le 10 ];  then RMEM=12582912;  WMEM=12582912;  ADV_WIN=2; NOTSENT=131072; TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_CALC" -le 20 ];  then RMEM=20971520;  WMEM=20971520;  ADV_WIN=2; NOTSENT=131072; TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_CALC" -le 40 ];  then RMEM=41943040;  WMEM=41943040;  ADV_WIN=3; NOTSENT=262144; TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_CALC" -le 64 ];  then RMEM=67108864;  WMEM=67108864;  ADV_WIN=3; NOTSENT=524288; TCP_RMEM_DEFAULT=1048576
-    else                                RMEM=134217728; WMEM=134217728; ADV_WIN=3; NOTSENT=524288; TCP_RMEM_DEFAULT=1048576
+    if   [ "$BUF_CALC" -le 10 ];  then RMEM=12582912;   WMEM=12582912;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_CALC" -le 20 ];  then RMEM=20971520;   WMEM=20971520;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_CALC" -le 40 ];  then RMEM=41943040;   WMEM=41943040;   ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_CALC" -le 64 ];  then RMEM=67108864;   WMEM=67108864;   ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_CALC" -le 128 ]; then RMEM=134217728;  WMEM=134217728;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=2097152
+    elif [ "$BUF_CALC" -le 256 ]; then RMEM=268435456;  WMEM=268435456;  ADV_WIN=3; NOTSENT=1048576; TCP_RMEM_DEFAULT=2097152
+    elif [ "$BUF_CALC" -le 512 ]; then RMEM=536870912;  WMEM=536870912;  ADV_WIN=3; NOTSENT=2097152; TCP_RMEM_DEFAULT=4194304
+    else                                RMEM=1073741824; WMEM=1073741824; ADV_WIN=3; NOTSENT=2097152; TCP_RMEM_DEFAULT=4194304
+    fi
+
+    # 限制：缓冲区不超过物理内存一半
+    local HALF_MEM=$(( MEM_MB * 1048576 / 2 ))
+    if [ "$RMEM" -gt "$HALF_MEM" ]; then
+        warn "缓冲区 $(( RMEM / 1048576 ))MB 超过物理内存 ${MEM_MB}MB 的一半，自动降级"
+        RMEM=$HALF_MEM
+        WMEM=$HALF_MEM
     fi
 
     local MIN_FREE SWAP TCP_MEM
-    if   [ "$MEM_MB" -eq 512  ]; then MIN_FREE=32768; SWAP=10; TCP_MEM="32768 49152 98304"
-    elif [ "$MEM_MB" -eq 1024 ]; then MIN_FREE=65536; SWAP=10; TCP_MEM="49152 65536 131072"
-    else                               MIN_FREE=65536; SWAP=5;  TCP_MEM="131072 196608 393216"
+    if   [ "$MEM_MB" -le 768  ]; then MIN_FREE=32768;  SWAP=10; TCP_MEM="32768 49152 98304"
+    elif [ "$MEM_MB" -le 1536 ]; then MIN_FREE=65536;  SWAP=10; TCP_MEM="49152 65536 131072"
+    elif [ "$MEM_MB" -le 4096 ]; then MIN_FREE=65536;  SWAP=5;  TCP_MEM="131072 196608 393216"
+    elif [ "$MEM_MB" -le 8192 ]; then MIN_FREE=131072; SWAP=5;  TCP_MEM="262144 393216 786432"
+    else                               MIN_FREE=262144; SWAP=5;  TCP_MEM="524288 786432 1572864"
     fi
 
     local BUF_MB=$(( RMEM / 1048576 ))
@@ -374,18 +456,22 @@ bbr_menu_bandwidth() {
     echo -e "  ${GREEN}1${NC}) 100 Mbps"
     echo -e "  ${GREEN}2${NC}) 200 Mbps"
     echo -e "  ${GREEN}3${NC}) 500 Mbps"
-    echo -e "  ${GREEN}4${NC}) 1 Gbps  (1024 Mbps)"
-    echo -e "  ${GREEN}5${NC}) 2 Gbps  (2048 Mbps)"
+    echo -e "  ${GREEN}4${NC}) 1 Gbps   (1024 Mbps)"
+    echo -e "  ${GREEN}5${NC}) 2 Gbps   (2048 Mbps)"
+    echo -e "  ${GREEN}6${NC}) 5 Gbps   (5120 Mbps)"
+    echo -e "  ${GREEN}7${NC}) 10 Gbps  (10240 Mbps)"
     echo -e "  ${RED}0${NC}) 返回"
     echo -e "  ${RED}00${NC}) 退出脚本"
     echo ""
-    read -rp "  请选择 [0-5]: " CH
+    read -rp "  请选择 [0-7]: " CH
     case "$CH" in
-        1) bbr_auto_calc "$MEM_MB" "$LAT_MS" 100  "$MEM_LBL" "$LAT_LBL" "100Mbps" ;;
-        2) bbr_auto_calc "$MEM_MB" "$LAT_MS" 200  "$MEM_LBL" "$LAT_LBL" "200Mbps" ;;
-        3) bbr_auto_calc "$MEM_MB" "$LAT_MS" 500  "$MEM_LBL" "$LAT_LBL" "500Mbps" ;;
-        4) bbr_auto_calc "$MEM_MB" "$LAT_MS" 1024 "$MEM_LBL" "$LAT_LBL" "1Gbps" ;;
-        5) bbr_auto_calc "$MEM_MB" "$LAT_MS" 2048 "$MEM_LBL" "$LAT_LBL" "2Gbps" ;;
+        1) bbr_auto_calc "$MEM_MB" "$LAT_MS" 100   "$MEM_LBL" "$LAT_LBL" "100Mbps" ;;
+        2) bbr_auto_calc "$MEM_MB" "$LAT_MS" 200   "$MEM_LBL" "$LAT_LBL" "200Mbps" ;;
+        3) bbr_auto_calc "$MEM_MB" "$LAT_MS" 500   "$MEM_LBL" "$LAT_LBL" "500Mbps" ;;
+        4) bbr_auto_calc "$MEM_MB" "$LAT_MS" 1024  "$MEM_LBL" "$LAT_LBL" "1Gbps" ;;
+        5) bbr_auto_calc "$MEM_MB" "$LAT_MS" 2048  "$MEM_LBL" "$LAT_LBL" "2Gbps" ;;
+        6) bbr_auto_calc "$MEM_MB" "$LAT_MS" 5120  "$MEM_LBL" "$LAT_LBL" "5Gbps" ;;
+        7) bbr_auto_calc "$MEM_MB" "$LAT_MS" 10240 "$MEM_LBL" "$LAT_LBL" "10Gbps" ;;
         0) return ;;
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项" ;;
@@ -417,18 +503,30 @@ bbr_menu_latency() {
 
 # ── 自动模式：内存子菜单 ─────────────────────────────────
 bbr_menu_auto() {
+    # 自动检测系统内存并标注推荐档位
+    local MEM_KB; MEM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    local SYS_MEM_MB=$(( ${MEM_KB:-0} / 1024 ))
+
     print_header "BBR 自动配置 — 选择内存"
+    echo -e "  系统检测内存：${BOLD}${SYS_MEM_MB}MB${NC}"
+    echo ""
     echo -e "  ${GREEN}1${NC}) 512 MB"
     echo -e "  ${GREEN}2${NC}) 1 GB"
     echo -e "  ${GREEN}3${NC}) 2 GB"
+    echo -e "  ${GREEN}4${NC}) 4 GB"
+    echo -e "  ${GREEN}5${NC}) 8 GB"
+    echo -e "  ${GREEN}6${NC}) 16 GB+"
     echo -e "  ${RED}0${NC}) 返回"
     echo -e "  ${RED}00${NC}) 退出脚本"
     echo ""
-    read -rp "  请选择 [0-3]: " CH
+    read -rp "  请选择 [0-6]: " CH
     case "$CH" in
-        1) bbr_menu_latency 512  "512MB" ;;
-        2) bbr_menu_latency 1024 "1GB" ;;
-        3) bbr_menu_latency 2048 "2GB" ;;
+        1) bbr_menu_latency 512   "512MB" ;;
+        2) bbr_menu_latency 1024  "1GB" ;;
+        3) bbr_menu_latency 2048  "2GB" ;;
+        4) bbr_menu_latency 4096  "4GB" ;;
+        5) bbr_menu_latency 8192  "8GB" ;;
+        6) bbr_menu_latency 16384 "16GB+" ;;
         0) return ;;
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项" ;;
@@ -450,35 +548,52 @@ bbr_menu_manual() {
     echo -e "  检测到系统内存：${BOLD}${MEM_MB}MB${NC}（内存参数将自动匹配）"
     echo ""
     echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
-    echo -e "  ${GREEN}1${NC}) 12 MB   — 低带宽 / 低延迟"
-    echo -e "  ${GREEN}2${NC}) 16 MB   — 小内存保守"
-    echo -e "  ${GREEN}3${NC}) 20 MB   — 中低带宽"
-    echo -e "  ${GREEN}4${NC}) 40 MB   — 中等带宽"
-    echo -e "  ${GREEN}5${NC}) 64 MB   — 高带宽推荐"
-    echo -e "  ${GREEN}6${NC}) 128 MB  — 超高带宽 / 高延迟"
+    echo -e "  ${GREEN}1${NC}) 12 MB    — 低带宽 / 低延迟"
+    echo -e "  ${GREEN}2${NC}) 16 MB    — 小内存保守"
+    echo -e "  ${GREEN}3${NC}) 20 MB    — 中低带宽"
+    echo -e "  ${GREEN}4${NC}) 40 MB    — 中等带宽（1G）"
+    echo -e "  ${GREEN}5${NC}) 64 MB    — 高带宽（1G+ 跨境）"
+    echo -e "  ${GREEN}6${NC}) 128 MB   — 超高带宽（2G/高延迟）"
+    echo -e "  ${GREEN}7${NC}) 256 MB   — 万兆 / 跨洋（5G/100ms）"
+    echo -e "  ${GREEN}8${NC}) 512 MB   — 万兆 / 长距离（10G/100ms）"
+    echo -e "  ${GREEN}9${NC}) 1024 MB  — 极限（10G+/200ms+，需 8G+ 内存）"
     echo -e "  ${RED}0${NC}) 返回"
     echo -e "  ${RED}00${NC}) 退出脚本"
     echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
     echo ""
-    read -rp "  请选择 [0-6]: " CH
+    read -rp "  请选择 [0-9]: " CH
 
     local RMEM WMEM ADV_WIN NOTSENT TCP_RMEM_DEFAULT BUF_LBL
     case "$CH" in
-        1) RMEM=12582912;  WMEM=12582912;  ADV_WIN=2; NOTSENT=131072; TCP_RMEM_DEFAULT=1048576; BUF_LBL=12 ;;
-        2) RMEM=16777216;  WMEM=16777216;  ADV_WIN=2; NOTSENT=131072; TCP_RMEM_DEFAULT=1048576; BUF_LBL=16 ;;
-        3) RMEM=20971520;  WMEM=20971520;  ADV_WIN=2; NOTSENT=131072; TCP_RMEM_DEFAULT=1048576; BUF_LBL=20 ;;
-        4) RMEM=41943040;  WMEM=41943040;  ADV_WIN=3; NOTSENT=262144; TCP_RMEM_DEFAULT=1048576; BUF_LBL=40 ;;
-        5) RMEM=67108864;  WMEM=67108864;  ADV_WIN=3; NOTSENT=524288; TCP_RMEM_DEFAULT=1048576; BUF_LBL=64 ;;
-        6) RMEM=134217728; WMEM=134217728; ADV_WIN=3; NOTSENT=524288; TCP_RMEM_DEFAULT=1048576; BUF_LBL=128 ;;
+        1) RMEM=12582912;   WMEM=12582912;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576; BUF_LBL=12 ;;
+        2) RMEM=16777216;   WMEM=16777216;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576; BUF_LBL=16 ;;
+        3) RMEM=20971520;   WMEM=20971520;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576; BUF_LBL=20 ;;
+        4) RMEM=41943040;   WMEM=41943040;   ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576; BUF_LBL=40 ;;
+        5) RMEM=67108864;   WMEM=67108864;   ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=1048576; BUF_LBL=64 ;;
+        6) RMEM=134217728;  WMEM=134217728;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=2097152; BUF_LBL=128 ;;
+        7) RMEM=268435456;  WMEM=268435456;  ADV_WIN=3; NOTSENT=1048576; TCP_RMEM_DEFAULT=2097152; BUF_LBL=256 ;;
+        8) RMEM=536870912;  WMEM=536870912;  ADV_WIN=3; NOTSENT=2097152; TCP_RMEM_DEFAULT=4194304; BUF_LBL=512 ;;
+        9) RMEM=1073741824; WMEM=1073741824; ADV_WIN=3; NOTSENT=2097152; TCP_RMEM_DEFAULT=4194304; BUF_LBL=1024 ;;
         0) return ;;
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项"; return ;;
     esac
 
+    # 安全检查：缓冲区不超过物理内存一半
+    local HALF_MEM=$(( MEM_MB * 1048576 / 2 ))
+    if [ "$RMEM" -gt "$HALF_MEM" ]; then
+        warn "缓冲区 ${BUF_LBL}MB 超过物理内存 ${MEM_MB}MB 的一半"
+        read -rp "  是否继续？(y/N，默认N): " GO
+        [ -z "$GO" ] && GO="n"
+        echo "$GO" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
+    fi
+
     local MIN_FREE SWAP TCP_MEM
-    if   [ "$MEM_MB" -le 768  ]; then MIN_FREE=32768; SWAP=10; TCP_MEM="32768 49152 98304"
-    elif [ "$MEM_MB" -le 1536 ]; then MIN_FREE=65536; SWAP=10; TCP_MEM="49152 65536 131072"
-    else                               MIN_FREE=65536; SWAP=5;  TCP_MEM="131072 196608 393216"
+    if   [ "$MEM_MB" -le 768  ]; then MIN_FREE=32768;  SWAP=10; TCP_MEM="32768 49152 98304"
+    elif [ "$MEM_MB" -le 1536 ]; then MIN_FREE=65536;  SWAP=10; TCP_MEM="49152 65536 131072"
+    elif [ "$MEM_MB" -le 4096 ]; then MIN_FREE=65536;  SWAP=5;  TCP_MEM="131072 196608 393216"
+    elif [ "$MEM_MB" -le 8192 ]; then MIN_FREE=131072; SWAP=5;  TCP_MEM="262144 393216 786432"
+    else                               MIN_FREE=262144; SWAP=5;  TCP_MEM="524288 786432 1572864"
     fi
 
     bbr_confirm_apply "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN"         "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT"         "手动选择（内存 ${MEM_MB}MB）" "$BUF_LBL"
@@ -500,7 +615,7 @@ bbr_menu_tc() {
     fi
 
     local DEV; DEV=$(ip route | awk '/^default/{print $5}')
-    local TX_Q; TX_Q=$(ls /sys/class/net/"$DEV"/queues/ 2>/dev/null | grep "^tx-" | wc -l)
+    local TX_Q; TX_Q=$(find /sys/class/net/"$DEV"/queues/ -maxdepth 1 -name "tx-*" 2>/dev/null | wc -l)
     local IS_MQ=0
     { tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" || [ "$TX_Q" -gt 1 ]; } && IS_MQ=1
     local CUR; CUR=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oE '(maxrate|rate) [^ ]+' | head -1 | awk '{print $2}')
@@ -531,7 +646,7 @@ bbr_menu_tc() {
         5) RATE=2048 ;;
         6)
             read -rp "  请输入限速值（Mbps）: " RATE
-            if ! [[ "$RATE" =~ ^[0-9]+$ ]] || [ "$RATE" -lt 1 ]; then
+            if ! echo "$RATE" | grep -qE '^[0-9]+$' || [ "$RATE" -lt 1 ]; then
                 error "无效数值"; return
             fi
             ;;
@@ -558,6 +673,19 @@ bbr_menu_tc() {
 }
 
 # ── initcwnd 菜单 ─────────────────────────────────────────
+# 检测是否在 LXC 容器内
+
+# 检测 OpenVZ / LXC 等受限容器
+is_openvz() {
+    [ -f /proc/vz/veinfo ] && return 0
+    grep -qaE 'openvz|lxc' /proc/1/environ 2>/dev/null && return 0
+    grep -qaE 'openvz|lxc' /proc/1/cgroup 2>/dev/null && return 0
+    return 1
+}
+
+is_lxc() {
+    grep -qa "lxc" /proc/1/environ 2>/dev/null     || [ -f /run/systemd/container ]     || grep -qa "container=lxc" /proc/1/environ 2>/dev/null     || { [ -f /proc/1/cgroup ] && grep -qa "lxc" /proc/1/cgroup 2>/dev/null; }
+}
 
 bbr_menu_initcwnd() {
     print_header "initcwnd 设置"
@@ -602,7 +730,7 @@ bbr_menu_initcwnd() {
         3) VAL=100 ;;
         4)
             read -rp "  请输入 initcwnd 值（1-1000）: " VAL
-            if ! [[ "$VAL" =~ ^[0-9]+$ ]] || [ "$VAL" -lt 1 ] || [ "$VAL" -gt 1000 ]; then
+            if ! echo "$VAL" | grep -qE '^[0-9]+$' || [ "$VAL" -lt 1 ] || [ "$VAL" -gt 1000 ]; then
                 error "无效数值"; return
             fi
             ;;
@@ -644,9 +772,18 @@ volcano_tcp_profile() {
     local RMEM WMEM TCP_MEM NOTSENT ADV_WIN MIN_FREE SWAP TCP_RMEM_DEFAULT LABEL BUF_MB
     case "$PROFILE" in
         balanced)
-            RMEM=67108864; WMEM=67108864; TCP_MEM="65536 131072 262144"
+            # 根据实际内存动态调整 balanced 缓冲区，避免超过物理内存一半
+            local _MEM_MB; _MEM_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
+            if [ "${_MEM_MB:-0}" -lt 512 ]; then
+                RMEM=16777216; WMEM=16777216; BUF_MB=16
+            elif [ "${_MEM_MB:-0}" -lt 1024 ]; then
+                RMEM=33554432; WMEM=33554432; BUF_MB=32
+            else
+                RMEM=67108864; WMEM=67108864; BUF_MB=64
+            fi
+            WMEM=$RMEM; TCP_MEM="65536 131072 262144"
             NOTSENT=262144; ADV_WIN=2; MIN_FREE=65536; SWAP=10
-            TCP_RMEM_DEFAULT=1048576; BUF_MB=64
+            TCP_RMEM_DEFAULT=1048576
             LABEL="均衡跨境  — 网页/代理/日常综合（推荐）" ;;
         latency)
             RMEM=33554432; WMEM=33554432; TCP_MEM="49152 98304 196608"
@@ -654,10 +791,21 @@ volcano_tcp_profile() {
             TCP_RMEM_DEFAULT=524288; BUF_MB=32
             LABEL="低延迟交互 — SSH/游戏/远程桌面/小包优先" ;;
         throughput)
-            RMEM=134217728; WMEM=134217728; TCP_MEM="131072 262144 524288"
-            NOTSENT=524288; ADV_WIN=3; MIN_FREE=131072; SWAP=5
-            TCP_RMEM_DEFAULT=1048576; BUF_MB=128
-            LABEL="高吞吐传输 — 大带宽/高延迟/下载上传优先" ;;
+            # 根据内存动态选缓冲区，万兆机器自动用大缓冲
+            local _MEM_MB; _MEM_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
+            if [ "${_MEM_MB:-0}" -lt 2048 ]; then
+                RMEM=67108864;   BUF_MB=64;   TCP_MEM="131072 196608 393216"; MIN_FREE=65536
+            elif [ "${_MEM_MB:-0}" -lt 4096 ]; then
+                RMEM=134217728;  BUF_MB=128;  TCP_MEM="131072 262144 524288"; MIN_FREE=131072
+            elif [ "${_MEM_MB:-0}" -lt 8192 ]; then
+                RMEM=268435456;  BUF_MB=256;  TCP_MEM="262144 393216 786432"; MIN_FREE=131072
+            else
+                RMEM=536870912;  BUF_MB=512;  TCP_MEM="524288 786432 1572864"; MIN_FREE=262144
+            fi
+            WMEM=$RMEM
+            NOTSENT=2097152; ADV_WIN=3; SWAP=5
+            TCP_RMEM_DEFAULT=4194304
+            LABEL="高吞吐传输 — 大带宽/万兆/下载上传优先" ;;
         *) error "未知预设：$PROFILE"; return 1 ;;
     esac
 
@@ -723,10 +871,74 @@ bbr_smart_wizard() {
     volcano_tcp_profile "$PROFILE"
 }
 
+
+# ── 检测是否有 sysctl 写入权限 ───────────────────────────
+has_sysctl_write() {
+    # 尝试写一个无害的参数测试权限
+    sysctl -w net.ipv4.tcp_fin_timeout=10 > /dev/null 2>&1 && return 0
+    return 1
+}
+
+# ── 检测内核是否支持 BBR ─────────────────────────────────
+bbr_check_kernel() {
+    # 1. 检测内核版本 >= 4.9
+    local KVER KMAJ KMIN
+    KVER=$(uname -r 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+')
+    KMAJ=$(echo "$KVER" | cut -d. -f1)
+    KMIN=$(echo "$KVER" | cut -d. -f2)
+    if [ "${KMAJ:-0}" -lt 4 ] || { [ "${KMAJ:-0}" -eq 4 ] && [ "${KMIN:-0}" -lt 9 ]; }; then
+        error "内核版本 $(uname -r) 低于 4.9，不支持 BBR"
+        echo -e "  ${DIM}Alpine: apk add linux-lts 或升级内核${NC}"
+        return 1
+    fi
+
+    # 2. 检测 tcp_bbr 模块是否可用
+    if lsmod 2>/dev/null | grep -q "tcp_bbr"; then
+        return 0  # 已加载
+    fi
+
+    # 尝试加载模块
+    if modprobe tcp_bbr 2>/dev/null; then
+        info "tcp_bbr 模块已加载 ✓"
+        return 0
+    fi
+
+    # Alpine 上尝试安装内核模块包
+    if command -v apk &>/dev/null; then
+        warn "tcp_bbr 模块未加载，尝试安装内核模块..."
+        local KFULL; KFULL=$(uname -r)
+        apk add --no-cache "linux-lts-dev" 2>/dev/null             || apk add --no-cache "linux-virt" 2>/dev/null || true
+        modprobe tcp_bbr 2>/dev/null && { info "tcp_bbr 模块已加载 ✓"; return 0; }
+    fi
+
+    # 检查 sysctl 是否已设置 bbr（有些内核内置不需要模块）
+    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+        return 0
+    fi
+
+    error "当前内核不支持 BBR（tcp_bbr 模块未找到）"
+    echo -e "  ${DIM}Alpine 解决方案：${NC}"
+    echo -e "  ${DIM}  apk add linux-lts && reboot${NC}"
+    echo -e "  ${DIM}或检查：/proc/sys/net/ipv4/tcp_available_congestion_control${NC}"
+    return 1
+}
+
 bbr_menu() {
+    # 进入时检测一次 sysctl 写入权限
+    local _BBR_NO_SYSCTL=0
+    if ! has_sysctl_write; then
+        _BBR_NO_SYSCTL=1
+    fi
     while true; do
         print_header "BBR TCP 调优"
         bbr_print_status
+        if [ "$_BBR_NO_SYSCTL" -eq 1 ]; then
+            echo ""
+            echo -e "  ${RED}${BOLD}⚠ 当前环境无 sysctl 写入权限${NC}"
+            echo -e "  ${DIM}检测为无特权容器（unprivileged container）${NC}"
+            echo -e "  ${DIM}sysctl 参数由宿主机控制，无法在容器内修改${NC}"
+            echo -e "  ${DIM}请联系 VPS 提供商开启 sysctl 权限，或使用 KVM/独立VPS${NC}"
+        fi
         echo ""
         echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
         echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
@@ -757,5 +969,8 @@ bbr_menu() {
         [ "${CH}" != "0" ] && { echo ""; read -rp "  按 Enter 返回..." _; }
     done
 }
+
+
+
 # ── 直接进入 BBR 菜单 ─────────────────────────────────────
 bbr_menu
