@@ -1,8 +1,8 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) V3.4.1 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) V3.5.3 独立提取
 
-专注 TCP 性能调优的交互式工具，支持智能向导、自动 BDP 计算、手动配置、tc 限速、initcwnd 调整，适用于跨境代理、游戏、万兆传输等不同场景。
+专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速、initcwnd 调整。
 
 ---
 
@@ -32,7 +32,7 @@ sudo ./bbr-tune.sh
             BBR TCP 调优
 ════════════════════════════════════════
   网卡 eth0  CC bbr  cwnd 10（默认）  限速 未设置
-  缓冲 rmem 64MB  wmem 64MB  tcp_r 64MB  tcp_w 64MB  物理内存 2048MB
+  缓冲 rmem 64MB  wmem 64MB  物理内存 2048MB
   ──────────────────────────────────────
   1) 智能向导（推荐）
   2) 自动配置（内存/延迟/带宽）
@@ -41,14 +41,46 @@ sudo ./bbr-tune.sh
   4) 限速设置（tc）   5) initcwnd 设置
   6) 备份 TCP 配置    7) 还原 TCP 配置
   0) 返回主菜单        00) 退出脚本
-  ──────────────────────────────────────
-  请选择 [0-7]:
 ```
 
-**状态栏实时显示：**
-- 网卡名、拥塞控制算法（CC）、initcwnd、tc 限速
-- rmem_max / wmem_max / tcp_rmem max / tcp_wmem max
-- 物理内存（缓冲区超过一半时显示黄色警告）
+---
+
+## 三类预设体系
+
+### 通用预设（普通 VPS）
+
+| 预设 | 缓冲区（按内存动态） | 适用 |
+|------|---------------------|------|
+| `balanced` 均衡跨境 | 16-64 MB | 网页 / 代理 / 日常综合 |
+| `latency` 低延迟交互 | 32 MB | SSH / 游戏 / 远程桌面 |
+| `throughput` 高吞吐 | 64-512 MB | 大带宽 / 万兆 / 下载上传 |
+
+只写入 15 个核心 BBR 参数，不污染系统。
+
+### 场景化预设（代理架构专用）
+
+| 预设 | 缓冲区（2GB 档） | NOTSENT | ADV_WIN | swap | 额外参数 |
+|------|-----------------|---------|---------|------|---------|
+| **中转机** `relay` | 64 MB | 256K（小） | 2 | 10 | 转发 + conntrack |
+| **落地机** `landing` | 128 MB | 2M（大） | 3 | 5 | 转发 |
+| **线路落地机** `line_landing` | 64 MB | 128K（极小） | 1 | 5 | 转发 |
+
+**三种架构的流量模型：**
+
+```
+中转机：     客户端 ←→ [中转] ←→ 落地        双向、并发多
+落地机：           中转 → [落地] → 目标网站    单向上行、大带宽
+线路落地机： 客户端 → [IPLC落地] → 目标网站    低延迟优先、直连用户
+```
+
+**设计差异：**
+
+| 维度 | 中转机 | 落地机 | 线路落地机 |
+|------|--------|--------|-----------|
+| 缓冲区策略 | 中等（兼顾并发） | 大（吃满跨境带宽） | 中等（低延迟优先） |
+| NOTSENT | 小（降单连接延迟） | 大（高吞吐） | 极小（即时响应） |
+| ADV_WIN | 2（标准） | 3（接收激进） | 1（省内存） |
+| swappiness | 10（容忍多进程） | 5 | 5 |
 
 ---
 
@@ -56,57 +88,52 @@ sudo ./bbr-tune.sh
 
 ### 1. 智能向导（推荐）
 
-启动时自动检测当前内存、内核 BBR 支持，给出推荐预设：
+```
+  [通用预设]
+  1) 均衡跨境    — 默认推荐，适合大多数 VPS
+  2) 低延迟交互  — SSH/游戏/远程桌面
+  3) 高吞吐传输  — 大带宽/下载上传优先
 
-| 选项 | 预设 | 适用场景 |
-|------|------|---------|
-| 1 | `balanced` 均衡跨境 | 网页 / 代理 / 日常综合 |
-| 2 | `latency` 低延迟交互 | SSH / 游戏 / 远程桌面 / 小包优先 |
-| 3 | `throughput` 高吞吐传输 | 大带宽 / 高延迟 / 下载上传 |
-| 4 | 自动推荐 | 根据当前内存智能选择 |
+  [场景化预设]
+  4) 中转机      — 双向转发/大并发（如 sing-box 中转）
+  5) 落地机      — 跨境上行/大缓冲（落地代理出口）
+  6) 线路落地机  — CN2/IPLC/直连用户/低延迟优先
 
-**自动推荐逻辑：**
+  7) 自动推荐    — 根据当前内存智能选择
+```
 
-| 内存 | 推荐预设 |
-|------|---------|
-| < 512 MB | `latency`（极小内存） |
-| < 768 MB | `latency`（小内存） |
-| < 1.5 GB | `balanced`（均衡） |
-| < 4 GB | `balanced`（2G 中等） |
-| ≥ 4 GB | `throughput`（万兆 / 跨洋） |
-
-应用前自动提示备份旧配置（默认 Y），备份后再确认应用（默认 Y）。
+应用前自动提示备份旧配置，备份后再确认应用。
 
 ---
 
 ### 2. 自动配置（BDP 三维计算）
 
-根据 **内存 × 延迟 × 带宽** 三个维度自动计算 BDP（带宽时延积），推导最优缓冲区。
+根据 **内存 × 延迟 × 带宽** 三维自动计算 BDP，推导最优缓冲区。
 
-**内存选项：** 512MB / 1GB / 2GB / 4GB / 8GB / 16GB+
+- **内存：** 512MB / 1GB / 2GB / 4GB / 8GB / 16GB+
+- **延迟：** 100ms 以内 / 100-200ms / 200ms 以上
+- **带宽：** 100M / 200M / 500M / 1G / 2G / 5G / 10G
 
-**延迟选项：**
-
-| 选项 | 适用场景 |
-|------|---------|
-| 100ms 以内 | 国内 / 亚洲近距离 |
-| 100 ~ 200ms | 跨国（如美西→中国） |
-| 200ms 以上 | 欧洲→中国 / 长距离 |
-
-**带宽选项：** 100M / 200M / 500M / 1G / 2G / 5G / 10G
-
-**BDP 估算公式：** `BDP = 带宽(MB/s) × 延迟(s) × 1.5`，结果自动映射到对应缓冲区档位。
-
-**安全保护：** 计算结果超过物理内存一半时自动降级。
+**BDP 估算：** `BDP = 带宽(MB/s) × 延迟(s) × 1.5`，结果超过物理内存一半自动降级。
 
 ---
 
-### 3. 手动选择缓冲区
+### 3. 手动选择缓冲区（两步式）
 
-自动检测系统内存，内存相关参数（tcp_mem / min_free / swappiness）自动匹配，只需选择缓冲区大小：
+**第一步：选用途**
+```
+  1) 中转机      — 双向转发/大并发（如 sing-box 中转）
+  2) 落地机      — 跨境上行/大缓冲（落地代理出口）
+  3) 线路落地机  — CN2/IPLC/直连用户/低延迟优先
+  4) 通用 / 单机 — 普通 VPS（网页/SSH/服务）
+```
 
-| 选项 | 缓冲区 | 适用场景 |
-|------|--------|---------|
+**第二步：选缓冲区（带场景化智能推荐）**
+
+工具会根据所选场景 + 当前内存，给出推荐档位提示，例如中转机 2GB 内存会提示「推荐 5 (64MB) 或 6 (128MB)」。
+
+| 档位 | 缓冲区 | 适用 |
+|------|--------|------|
 | 1 | 12 MB | 低带宽 / 低延迟 |
 | 2 | 16 MB | 小内存保守 |
 | 3 | 20 MB | 中低带宽 |
@@ -117,115 +144,99 @@ sudo ./bbr-tune.sh
 | 8 | 512 MB | 万兆 / 长距离（10G/100ms） |
 | 9 | 1024 MB | 极限（10G+/200ms+，需 8G+ 内存） |
 
-选择超过物理内存一半的档位时会警告确认，避免低内存机器误选导致 OOM。
+选定后窗口/队列参数按场景独立计算，并自动注入对应的转发/conntrack 参数。
 
 ---
 
 ### 4. 限速设置（tc）
 
-使用 `tc` 对出口带宽进行精确限速，防止 BBR 大缓冲区导致重传（Retr）爆炸。
+防止 BBR 大缓冲区导致重传爆炸。
 
-| 选项 | 速率 |
+| 档位 | 速率 |
 |------|------|
-| 1 | 200 Mbps |
-| 2 | 500 Mbps |
-| 3 | 780 Mbps |
-| 4 | 1 Gbps（1024 Mbps） |
-| 5 | 2 Gbps（2048 Mbps） |
-| 6 | 自定义（输入 Mbps 值） |
+| 1-5 | 200M / 500M / 780M / 1G / 2G |
+| 6 | 自定义（Mbps） |
 | 7 | 取消限速 |
 
-**自动适配队列类型：** 检测网卡队列数，多队列（mq）使用 `tbf`，单队列使用 `fq maxrate`。
+**自动适配队列：** 多队列网卡（mq）用 `tbf`，单队列用 `fq maxrate`。持久化到 `/etc/systemd/system/tc-fq.service`。
 
-**持久化：** 限速规则写入 `/etc/systemd/system/tc-fq.service`，重启后自动恢复。
-
-> **OpenVZ 容器：** 自动检测并提示，tc 在 OpenVZ 共享内核下通常被宿主机限制，建议联系服务商在宿主机层面配置。
+> **OpenVZ：** 自动检测并提示，tc 通常被宿主机限制。
 
 ---
 
 ### 5. initcwnd 设置
 
-调整 TCP 初始拥塞窗口，对高延迟线路的首包速度提升明显。
-
-| 选项 | 值 | 说明 |
+| 档位 | 值 | 说明 |
 |------|-----|------|
 | 1 | 10 | 默认保守 |
 | 2 | 50 | 跨国高延迟推荐 |
-| 3 | 100 | 激进（可能丢包） |
-| 4 | 自定义 | 1 ~ 1000 |
+| 3 | 100 | 激进 |
+| 4 | 自定义 | 1-1000 |
 
-**持久化：** 写入 `/etc/systemd/system/initcwnd.service`，重启后自动执行。
+持久化到 `/etc/systemd/system/initcwnd.service`。
 
-> **LXC 容器：** 自动检测，LXC 无独立网络命名空间权限，`ip route change` 会被拒绝，工具会提示并给出宿主机手动命令。
+> **LXC：** 自动检测，无独立网络命名空间权限时给出宿主机命令。
 
 ---
 
 ### 6 / 7. 备份与还原
 
-**备份：** 将当前 `/etc/sysctl.d/99-vps-bbr.conf` 复制为带时间戳的备份文件，每次应用新配置前自动触发（默认 Y）。
-
-**还原：** 列出所有历史备份，按编号选择还原，并立即 `sysctl -p` 生效。支持一键清除全部备份。
-
-备份文件示例：
-```
-/etc/sysctl.d/99-vps-bbr.conf.bak.20260522_163000
-```
+应用新配置前自动备份带时间戳的旧配置，可一键还原或清除全部备份。
 
 ---
 
-## 写入的 sysctl 参数（V3.4.1 精简版）
+## 写入的 sysctl 参数
 
-配置写入 `/etc/sysctl.d/99-vps-bbr.conf`，不修改 `/etc/sysctl.conf`。
-
-**仅 15 个核心参数，按功能分 4 组：**
+### 通用预设（15 个核心参数）
 
 ```ini
 # ── 内存管理 ──
-vm.swappiness                          # 内存交换倾向
-vm.min_free_kbytes                     # 内核保留内存下限
+vm.swappiness
+vm.min_free_kbytes
 
 # ── BBR 核心 ──
-net.core.default_qdisc = fq            # 配合 BBR 的队列算法
-net.ipv4.tcp_congestion_control = bbr  # 启用 BBR 拥塞控制
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
 
 # ── 缓冲区 ──
-net.core.rmem_max                      # Socket 读缓冲上限
-net.core.wmem_max                      # Socket 写缓冲上限
-net.ipv4.tcp_rmem                      # TCP 读缓冲范围
-net.ipv4.tcp_wmem                      # TCP 写缓冲范围
-net.ipv4.tcp_mem                       # TCP 总内存控制
-net.ipv4.tcp_adv_win_scale             # 接收窗口缩放系数
-net.ipv4.tcp_notsent_lowat             # 发送队列低水位
+net.core.rmem_max / wmem_max
+net.ipv4.tcp_rmem / tcp_wmem
+net.ipv4.tcp_mem
+net.ipv4.tcp_adv_win_scale
+net.ipv4.tcp_notsent_lowat
 
 # ── 连接质量 ──
-net.ipv4.tcp_fastopen = 3              # 启用 TCP Fast Open
-net.ipv4.tcp_mtu_probing = 1           # PMTU 探测（改善跨境链路）
-net.ipv4.tcp_ecn = 2                   # ECN 显式拥塞通知
-net.ipv4.tcp_slow_start_after_idle = 0 # 空闲后不重置拥塞窗口
-net.ipv4.tcp_tw_reuse = 1              # TIME_WAIT 复用
-net.ipv4.tcp_fin_timeout = 10          # 缩短 FIN_WAIT 超时
-net.ipv4.tcp_keepalive_time = 60       # keepalive 探测间隔
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_fastopen_blackhole_timeout_sec = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_ecn = 2
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 60
 ```
 
-**有意删除的参数（VPS 无意义或内核已最优）：**
+### 场景化预设额外参数
 
-| 参数 | 删除原因 |
-|------|---------|
-| `vm.dirty_background_ratio` | 与 BBR 无关，影响磁盘写入策略 |
-| `kernel.numa_balancing` | NUMA 是多路服务器特性，VPS 无效 |
-| `kernel.panic / sysrq / pid_max` | 与 TCP 调优无关 |
-| `vm.overcommit_memory` | Redis 专用，不应默认写入 |
-| `net.core.netdev_max_backlog` | 万兆+ 才用得上，VPS 默认够 |
-| `net.core.somaxconn` | 应用层参数 |
-| `net.core.rmem_default / wmem_default` | 内核默认 212992 已最佳 |
-| `net.ipv4.tcp_no_metrics_save` | 默认 0 已最佳 |
-| `net.ipv4.tcp_max_tw_buckets` | 内核根据内存自动调整 |
-| `net.ipv4.tcp_max_syn_backlog` | 内核默认通常够用 |
-| `net.ipv4.tcp_keepalive_intvl / probes` | 细节非必须 |
-| `net.ipv4.ip_local_port_range` | 跟拥塞控制无关 |
-| `net.ipv4.conf.all.rp_filter` | 新内核默认严格模式，强行 1 反而宽松 |
-| `net.ipv4.conf.all.arp_announce` | 单 IP VPS 无意义 |
-| `tcp_timestamps / tcp_window_scaling / tcp_sack` | 内核默认开启，重复设置无意义 |
+**中转机 / 落地机 / 线路落地机 共有（5 项转发参数）：**
+
+```ini
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_max_syn_backlog = 8192
+```
+
+**仅中转机额外（3 项 conntrack）：**
+
+```ini
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+```
+
+应用场景预设前自动 `modprobe nf_conntrack` 加载内核模块。
 
 ---
 
@@ -233,52 +244,47 @@ net.ipv4.tcp_keepalive_time = 60       # keepalive 探测间隔
 
 | 机制 | 说明 |
 |------|------|
-| **内核支持检测** | 应用前检测内核 ≥ 4.9、`tcp_bbr` 模块、`tcp_available_congestion_control` |
-| **sysctl 权限检测** | 自动识别无特权容器，立即拦截并提示 |
-| **物理内存校验** | 缓冲区超过物理内存一半自动降级或警告 |
-| **逐行应用** | `sysctl -w` 逐行写入，跳过 Alpine 等内核不支持的参数（如 `default_qdisc`） |
-| **自动备份** | 应用前自动备份旧配置，可一键还原 |
-| **配置校验** | 写入前先用 `nft -c` 等价方式校验 |
+| 内核支持检测 | 应用前检测内核 ≥ 4.9、`tcp_bbr` 模块 |
+| sysctl 权限检测 | 自动识别无特权容器并拦截 |
+| 物理内存校验 | 缓冲区超过物理内存一半自动降级 |
+| 逐行应用 | `sysctl -w` 逐行写入，跳过内核不支持的参数 |
+| conntrack 模块 | 场景预设前自动 modprobe |
+| 自动备份 | 应用前备份，可一键还原 |
 
 ---
 
 ## 兼容性
 
-| 环境 | 支持情况 |
-|------|---------|
-| Debian / Ubuntu | ✓ 完整支持 |
-| CentOS / Rocky / AlmaLinux | ✓ 完整支持 |
-| Alpine Linux | ✓ BusyBox ash 兼容（去除 `[[ ]]` / `=~` / 数组等 bash 专属语法） |
-| OpenWrt | ✓ dumb 终端兼容（`safe_clear`） |
-| KVM / 独立 VPS | ✓ 完整支持 |
-| LXC 容器 | ⚠ sysctl / initcwnd 功能受限，自动提示 |
+| 环境 | 支持 |
+|------|------|
+| Debian / Ubuntu / CentOS / Rocky | ✓ 完整 |
+| Alpine Linux | ✓ BusyBox ash 兼容 |
+| OpenWrt | ✓ dumb 终端兼容 |
+| LXC 容器 | ⚠ sysctl/initcwnd 受限，自动提示 |
 | OpenVZ 容器 | ⚠ tc 限速受限，自动提示 |
-| 无特权容器 | ⚠ sysctl 写入被拒，自动检测并友好提示 |
+| 无特权容器 | ⚠ sysctl 写入被拒，自动检测 |
 
 ---
 
-## 万兆 / 大内存场景实战
+## 实战示例
 
-**10 Gbps + 8GB 内存 VPS 推荐配置：**
-
+**sing-box 中转机（2GB 内存）：**
 ```
-智能向导 → 自动推荐 throughput 预设
-↓
-缓冲区 256 MB（rmem_max / wmem_max）
-↓
-tcp_mem 262144 393216 786432
-↓
-min_free_kbytes 131072
+智能向导 → 4) 中转机
+→ 自动写入 64MB 缓冲 + 转发 + conntrack（1048576 连接）
 ```
 
-**跨洋大流量（10Gbps + 200ms）：**
-
+**跨境落地机（8GB 内存 + 10Gbps）：**
 ```
-手动配置 → 选 512 MB 缓冲区
-↓
-配合 initcwnd 50（跨国高延迟推荐）
-↓
-启用 tc 限速 9Gbps（防止重传爆炸）
+手动配置 → 2) 落地机 → 8 (512MB)
+→ 512MB 大缓冲吃满带宽 + 转发参数
+```
+
+**CN2 GIA 线路落地（1GB 内存）：**
+```
+智能向导 → 6) 线路落地机
+→ 32MB 缓冲 + ADV_WIN=1 低延迟 + 转发参数
+配合 initcwnd 50
 ```
 
 ---
@@ -287,46 +293,34 @@ min_free_kbytes 131072
 
 | 文件 | 说明 |
 |------|------|
-| `/etc/sysctl.d/99-vps-bbr.conf` | sysctl 调优配置（主配置） |
-| `/etc/sysctl.d/99-vps-bbr.conf.bak.*` | 历史备份文件（按时间戳） |
-| `/etc/systemd/system/tc-fq.service` | tc 限速开机自启服务 |
-| `/etc/systemd/system/initcwnd.service` | initcwnd 开机自启服务 |
+| `/etc/sysctl.d/99-vps-bbr.conf` | sysctl 调优配置 |
+| `/etc/sysctl.d/99-vps-bbr.conf.bak.*` | 历史备份 |
+| `/etc/systemd/system/tc-fq.service` | tc 限速自启 |
+| `/etc/systemd/system/initcwnd.service` | initcwnd 自启 |
 
 ---
 
 ## 常用查看命令
 
 ```bash
-# 当前拥塞控制算法
-sysctl net.ipv4.tcp_congestion_control
+sysctl net.ipv4.tcp_congestion_control          # 当前算法
+sysctl net.ipv4.tcp_available_congestion_control # 可用算法
+sysctl net.core.rmem_max net.core.wmem_max       # 缓冲区
+lsmod | grep tcp_bbr                              # 模块
+cat /etc/sysctl.d/99-vps-bbr.conf                 # 当前配置
 
-# 可用拥塞控制算法（确认 bbr 是否支持）
-sysctl net.ipv4.tcp_available_congestion_control
-
-# 缓冲区
-sysctl net.core.rmem_max net.core.wmem_max
-sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
-
-# 队列算法
-sysctl net.core.default_qdisc
-
-# tcp_bbr 模块
-lsmod | grep tcp_bbr
-
-# 查看当前生效配置
-cat /etc/sysctl.d/99-vps-bbr.conf
+# 中转机查看 conntrack
+sysctl net.netfilter.nf_conntrack_max
+cat /proc/sys/net/netfilter/nf_conntrack_count    # 当前连接数
 ```
 
-如果 `tcp_available_congestion_control` 里没有 `bbr`，说明内核不支持，需要换内核：
+如果 `tcp_available_congestion_control` 没有 `bbr`，需换内核：
 
 ```bash
 # Debian/Ubuntu
-apt install linux-image-amd64
-reboot
-
+apt install linux-image-amd64 && reboot
 # Alpine
-apk add linux-lts
-reboot
+apk add linux-lts && reboot
 ```
 
 ---
@@ -337,7 +331,7 @@ reboot
 https://github.com/chnnic/BBR-tune
 ```
 
-完整 VPS 开荒脚本（包含本工具及更多功能）：
+完整 VPS 开荒脚本（含本工具及更多功能）：
 
 ```
 https://github.com/chnnic/SSH-Hardening
@@ -349,11 +343,11 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
-| **基于主脚本 V3.4.1** | sysctl 参数精简到 15 个，按功能分组 |
-| V3.2.5 | 支持万兆 / 4G+ 内存（256/512/1024MB 缓冲区） |
-| V3.2.1 | 无特权容器 sysctl 权限检测 |
+| **基于主脚本 V3.5.3** | 手动配置加场景选择层（中转/落地/线路落地各自调优） |
+| V3.5.1 | 场景预设注入转发 + conntrack 参数，自动 modprobe |
+| V3.5.0 | 新增 3 个场景化预设（中转/落地/线路落地） |
+| V3.4.1 | sysctl 参数精简到 15 个核心，按功能分组 |
+| V3.2.5 | 支持万兆 / 4G+ 内存（256/512/1024MB 缓冲） |
 | V3.2.0 | sysctl 逐行写入，跳过 Alpine 不支持的参数 |
-| V3.1.9 | balanced 预设按内存动态调整 |
-| V3.1.8 | 内核 BBR 支持检测（kernel ≥ 4.9） |
-| V3.1.6 | Alpine ash 兼容（去除 bash 专属语法） |
-| V3.0.0 | 整合 BBR 智能向导 + 三预设（balanced/latency/throughput） |
+| V3.1.6 | Alpine ash 兼容 |
+| V3.0.0 | 整合 BBR 智能向导 + 三通用预设 |
