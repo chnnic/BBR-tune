@@ -1,8 +1,10 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) V3.5.3 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.5.5 独立提取
 
-专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速、initcwnd 调整。
+专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
+
+> **运行依赖：** 需 **bash**（使用了数组 / `[[ ]]` / here-string 等）。Alpine 需 `apk add bash`，OpenWrt 需 `opkg install bash`。脚本头部带解释器守卫，非 bash 环境会自动切换或 fail-fast 提示。
 
 ---
 
@@ -63,7 +65,7 @@ sudo ./bbr-tune.sh
 |------|-----------------|---------|---------|------|---------|
 | **中转机** `relay` | 64 MB | 256K（小） | 2 | 10 | 转发 + conntrack |
 | **落地机** `landing` | 128 MB | 2M（大） | 3 | 5 | 转发 |
-| **线路落地机** `line_landing` | 64 MB | 128K（极小） | 1 | 5 | 转发 |
+| **线路落地机** `line_landing` | 64 MB | 128K（极小） | 2 | 5 | 转发 |
 
 **三种架构的流量模型：**
 
@@ -79,7 +81,7 @@ sudo ./bbr-tune.sh
 |------|--------|--------|-----------|
 | 缓冲区策略 | 中等（兼顾并发） | 大（吃满跨境带宽） | 中等（低延迟优先） |
 | NOTSENT | 小（降单连接延迟） | 大（高吞吐） | 极小（即时响应） |
-| ADV_WIN | 2（标准） | 3（接收激进） | 1（省内存） |
+| ADV_WIN | 2（标准） | 3（接收激进） | 2（保高 BDP 接收） |
 | swappiness | 10（容忍多进程） | 5 | 5 |
 
 ---
@@ -130,19 +132,20 @@ sudo ./bbr-tune.sh
 
 **第二步：选缓冲区（带场景化智能推荐）**
 
-工具会根据所选场景 + 当前内存，给出推荐档位提示，例如中转机 2GB 内存会提示「推荐 5 (64MB) 或 6 (128MB)」。
+工具会根据所选场景 + 当前内存，给出推荐档位提示，例如中转机 2GB 内存会提示「推荐 6 (64MB) 或 7 (128MB)」。
 
 | 档位 | 缓冲区 | 适用 |
 |------|--------|------|
 | 1 | 12 MB | 低带宽 / 低延迟 |
 | 2 | 16 MB | 小内存保守 |
 | 3 | 20 MB | 中低带宽 |
-| 4 | 40 MB | 中等带宽（1G） |
-| 5 | 64 MB | 高带宽（1G+ 跨境） |
-| 6 | 128 MB | 超高带宽（2G/高延迟） |
-| 7 | 256 MB | 万兆 / 跨洋（5G/100ms） |
-| 8 | 512 MB | 万兆 / 长距离（10G/100ms） |
-| 9 | 1024 MB | 极限（10G+/200ms+，需 8G+ 内存） |
+| 4 | 32 MB | 1G 跨境甜点区（~150ms BDP，推荐） |
+| 5 | 40 MB | 中等带宽（1G） |
+| 6 | 64 MB | 高带宽（1G+ 跨境） |
+| 7 | 128 MB | 超高带宽（2G/高延迟） |
+| 8 | 256 MB | 万兆 / 跨洋（5G/100ms） |
+| 9 | 512 MB | 万兆 / 长距离（10G/100ms） |
+| 10 | 1024 MB | 极限（10G+/200ms+，需 8G+ 内存） |
 
 选定后窗口/队列参数按场景独立计算，并自动注入对应的转发/conntrack 参数。
 
@@ -158,8 +161,11 @@ sudo ./bbr-tune.sh
 | 6 | 自定义（Mbps） |
 | 7 | 取消限速 |
 
-**自动适配队列：** 多队列网卡（mq）用 `tbf`，单队列用 `fq maxrate`。持久化到 `/etc/systemd/system/tc-fq.service`。
+**队列结构（保留 BBR pacing）：** 统一用 `htb` 做聚合整形（真正的硬上限）、叶子挂 `fq` 保留 BBR 的 pacing。旧版多队列网卡用 root `tbf` 会顶掉 `fq`、废掉 BBR pacing，反而伤害跨境高 BDP 吞吐；而单纯 `fq maxrate` 只能限「每流」、限不住聚合。`htb`(整形) + `fq`(pacing) 同时满足两者。
 
+**burst 随速率缩放：** `burst/cburst` 按速率自动缩放（约 8ms 量级，≈ RATE KB，下限 32KB），避免固定 burst 在高速率下令牌饥饿导致跑不满设定速率。持久化到 `/etc/systemd/system/tc-fq.service`（`After/Wants=network-online.target`，确保网卡就绪后再应用）。
+
+> **依赖：** 需内核 `sch_htb` + `sch_fq` 模块（主流发行版默认含）；缺失时自动报错并清理 root qdisc，不会留半套规则。
 > **OpenVZ：** 自动检测并提示，tc 通常被宿主机限制。
 
 ---
@@ -258,7 +264,7 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 | 环境 | 支持 |
 |------|------|
 | Debian / Ubuntu / CentOS / Rocky | ✓ 完整 |
-| Alpine Linux | ✓ BusyBox ash 兼容 |
+| Alpine Linux | ✓ 需 `apk add bash`（非 bash 自动切换 / fail-fast 提示） |
 | OpenWrt | ✓ dumb 终端兼容 |
 | LXC 容器 | ⚠ sysctl/initcwnd 受限，自动提示 |
 | OpenVZ 容器 | ⚠ tc 限速受限，自动提示 |
@@ -283,7 +289,7 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 **CN2 GIA 线路落地（1GB 内存）：**
 ```
 智能向导 → 6) 线路落地机
-→ 32MB 缓冲 + ADV_WIN=1 低延迟 + 转发参数
+→ 32MB 缓冲 + ADV_WIN=2（保高 BDP 接收）+ NOTSENT 极小（低延迟）+ 转发参数
 配合 initcwnd 50
 ```
 
@@ -343,7 +349,8 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
-| **基于主脚本 V3.5.3** | 手动配置加场景选择层（中转/落地/线路落地各自调优） |
+| **同步 V3.5.5** | 限速改 htb 整形 + fq pacing（多队列网卡保留 BBR pacing）；burst 随速率缩放；切换预设复位残留场景键；新增 32MB 缓冲档；修 BDP 双截断；line_landing ADV_WIN 1→2；加 bash 解释器守卫 |
+| V3.5.2 | 手动配置加场景选择前置层（中转/落地/线路落地各自调优） |
 | V3.5.1 | 场景预设注入转发 + conntrack 参数，自动 modprobe |
 | V3.5.0 | 新增 3 个场景化预设（中转/落地/线路落地） |
 | V3.4.1 | sysctl 参数精简到 15 个核心，按功能分组 |
