@@ -2,14 +2,32 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（基于 V3.5.3）
+#  从 VPS 开荒脚本独立提取（同步至 V3.5.6）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.5.6: 新增 UDP 缓冲(QUIC/Hysteria2)、场景预设加端口范围/tw_buckets/file-max
+#          防高并发端口耗尽、应用场景预设后检测代理 service LimitNOFILE
+#  V3.5.5: 限速改 htb 整形+fq pacing(保 BBR)、burst 随速率缩放、
+#          切换预设复位残留场景键、新增 32MB 缓冲档、修 BDP 双截断
 #  用法：bash bbr-tune.sh
 # ============================================================
 
+# ── 解释器守卫：本脚本依赖 bash（数组 / [[ ]] / here-string 等）──
+if [ -z "$BASH_VERSION" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    fi
+    echo "本脚本需要 bash 运行，当前 shell 不是 bash 且系统未安装 bash。"
+    echo "请先安装 bash 后重试："
+    echo "  Alpine:   apk add bash"
+    echo "  OpenWrt:  opkg update && opkg install bash"
+    echo "  Debian:   apt-get install -y bash"
+    echo "  CentOS:   yum install -y bash"
+    exit 1
+fi
+
 # ── 颜色定义 ──────────────────────────────────────────────
 RED=$'\033[0;31m'
-GREEN=$'\033[0;32m'-
+GREEN=$'\033[0;32m'
 YELLOW=$'\033[1;33m'
 BLUE=$'\033[0;34m'
 CYAN=$'\033[0;36m'
@@ -253,6 +271,44 @@ bbr_apply_sysctl() {
     local CONFIG="$1"
     ensure_sysctl || return 1
     mkdir -p "$(dirname "$SYSCTL_FILE")" 2>/dev/null || true
+
+    # ── 切换预设时复位「旧配置写过、但新配置不再包含」的场景专有键 ──
+    # 否则从中转/落地降级回普通预设后，ip_forward / conntrack 等会一直残留在内核里。
+    # 仅复位本脚本场景预设管理的键，且新配置确实不含该键时才动；ip_forward 谨慎处理。
+    if [ -f "$SYSCTL_FILE" ]; then
+        local SCENE_KEYS="net.ipv4.ip_forward net.ipv6.conf.all.forwarding net.core.somaxconn net.core.netdev_max_backlog net.ipv4.tcp_max_syn_backlog net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_tcp_timeout_established net.netfilter.nf_conntrack_tcp_timeout_time_wait net.ipv4.ip_local_port_range net.ipv4.tcp_max_tw_buckets fs.file-max"
+        local k STALE=""
+        for k in $SCENE_KEYS; do
+            if grep -qE "^${k} *=" "$SYSCTL_FILE" 2>/dev/null && ! echo "$CONFIG" | grep -qE "^${k} *="; then
+                STALE="$STALE $k"
+            fi
+        done
+        if [ -n "$STALE" ]; then
+            warn "检测到上次场景预设遗留参数，新预设不再需要："
+            for k in $STALE; do echo -e "    ${DIM}${k}${NC}"; done
+            if echo "$STALE" | grep -q 'ip_forward'; then
+                warn "其中 ip_forward 复位后将关闭内核转发，若本机仍在做端口转发/中转请勿复位"
+            fi
+            read -rp "  是否复位这些残留参数为系统默认？(y/N，默认N): " DORST
+            [ -z "$DORST" ] && DORST="n"
+            if echo "$DORST" | grep -qiE '^y(es)?$'; then
+                for k in $STALE; do
+                    # 端口范围 / tw_buckets / file-max 复位成 0 非法或有害，给内核安全默认
+                    case "$k" in
+                        net.ipv4.ip_forward|net.ipv6.conf.all.forwarding) sysctl -w "${k}=0" >/dev/null 2>&1 ;;
+                        net.ipv4.ip_local_port_range) sysctl -w "${k}=32768 60999" >/dev/null 2>&1 || true ;;
+                        net.ipv4.tcp_max_tw_buckets)  sysctl -w "${k}=131072" >/dev/null 2>&1 || true ;;
+                        fs.file-max)                  : ;;
+                        *) sysctl -w "${k}=0" >/dev/null 2>&1 || true ;;
+                    esac
+                done
+                info "残留场景参数已复位"
+            else
+                warn "保留残留参数（仍生效于当前内核，直到下次手动复位或重启）"
+            fi
+        fi
+    fi
+
     echo "$CONFIG" > "$SYSCTL_FILE"
 
     # 逐行应用，跳过不支持的参数（Alpine 部分内核不支持 default_qdisc 等）
@@ -279,41 +335,42 @@ bbr_apply_sysctl() {
 bbr_apply_tc() {
     local RATE="$1"
     local DEV; DEV=$(ip route | awk '/^default/{print $5}')
-    local TX_Q; TX_Q=$(find /sys/class/net/"$DEV"/queues/ -maxdepth 1 -name "tx-*" 2>/dev/null | wc -l)
-    local IS_MQ=0
-    { tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" || [ "$TX_Q" -gt 1 ]; } && IS_MQ=1
+    [ -z "$DEV" ] && { error "无法确定默认出口网卡"; return 1; }
 
-    if [ "$IS_MQ" -eq 1 ]; then
-        tc qdisc replace dev "$DEV" root tbf rate "${RATE}mbit" burst 10mbit latency 50ms
-        cat > "$SERVICE_TC" << EOF
-[Unit]
-Description=FQ rate limit
-After=network.target
-[Service]
-Type=oneshot
-ExecStart=/sbin/tc qdisc replace dev ${DEV} root tbf rate ${RATE}mbit burst 10mbit latency 50ms
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-EOF
-    else
-        tc qdisc replace dev "$DEV" root fq maxrate "${RATE}mbit"
-        cat > "$SERVICE_TC" << EOF
-[Unit]
-Description=FQ rate limit
-After=network.target
-[Service]
-Type=oneshot
-ExecStart=/sbin/tc qdisc replace dev ${DEV} root fq maxrate ${RATE}mbit
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-EOF
+    # burst/cburst 随速率缩放（约 8ms 量级，≈ RATE KB），下限 32KB。
+    # 固定 burst 会在高速率下令牌饥饿，导致跑不满设定速率。
+    local BURST_KB=$RATE
+    [ "$BURST_KB" -lt 32 ] && BURST_KB=32
+
+    # 关键：用 htb 做「聚合」整形（真正硬上限），叶子挂 fq 保留 BBR pacing。
+    # 旧版多队列网卡用 root tbf 会顶掉 fq、废掉 BBR pacing，且单纯 fq maxrate
+    # 只能限「每流」不能限聚合。htb(整形) + fq(pacing) 才同时满足两者。
+    tc qdisc del dev "$DEV" root 2>/dev/null
+    if ! tc qdisc add dev "$DEV" root handle 1: htb default 10 2>/dev/null \
+        || ! tc class add dev "$DEV" parent 1: classid 1:10 htb \
+                rate "${RATE}mbit" ceil "${RATE}mbit" burst "${BURST_KB}kb" cburst "${BURST_KB}kb" 2>/dev/null \
+        || ! tc qdisc add dev "$DEV" parent 1:10 handle 100: fq maxrate "${RATE}mbit" 2>/dev/null; then
+        error "tc 规则应用失败（内核可能缺 sch_htb / sch_fq 模块）"
+        tc qdisc del dev "$DEV" root 2>/dev/null
+        return 1
     fi
+
+    cat > "$SERVICE_TC" << EOF
+[Unit]
+Description=TC egress shaping ${RATE}Mbps (htb shape + fq pacing for BBR)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/sbin/tc qdisc del dev ${DEV} root 2>/dev/null; /sbin/tc qdisc add dev ${DEV} root handle 1: htb default 10 && /sbin/tc class add dev ${DEV} parent 1: classid 1:10 htb rate ${RATE}mbit ceil ${RATE}mbit burst ${BURST_KB}kb cburst ${BURST_KB}kb && /sbin/tc qdisc add dev ${DEV} parent 1:10 handle 100: fq maxrate ${RATE}mbit'
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
     svc_daemon_reload
     svc_enable tc-fq
     rc-service tc-fq restart 2>/dev/null || systemctl restart tc-fq 2>/dev/null || true
-    info "tc 限速已应用：${RATE}Mbps ✓"
+    info "tc 限速已应用：${RATE}Mbps（htb 聚合整形 + fq pacing，burst ${BURST_KB}KB）✓"
 }
 
 # ── 生成 sysctl 配置内容 ──────────────────────────────────
@@ -349,6 +406,10 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_keepalive_time = 60
+
+# ── UDP 缓冲（QUIC / Hysteria2 / TUIC 代理）──
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
 EOF
 
     # 中转机 / 落地机 / 线路落地机 共同需要的转发与 conntrack
@@ -362,6 +423,9 @@ net.ipv6.conf.all.forwarding = 1
 net.core.somaxconn = 8192
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_max_tw_buckets = 500000
+fs.file-max = 1048576
 EOF
             ;;
     esac
@@ -379,6 +443,35 @@ EOF
 }
 
 # ── 确认并应用参数 ────────────────────────────────────────
+# ── 检测常见代理 service 的 LimitNOFILE，偏低则提示写 drop-in ──
+# fs.file-max 只是系统总上限，单进程 fd 上限由 systemd 的 LimitNOFILE 决定。
+bbr_check_limitnofile() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local SVCS="xray sing-box hysteria hysteria-server tuic v2ray trojan trojan-go mihomo clash"
+    local svc found=0
+    for svc in $SVCS; do
+        systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service" || continue
+        found=1
+        local CUR
+        CUR=$(systemctl show -p LimitNOFILE --value "${svc}.service" 2>/dev/null)
+        if [ -n "$CUR" ] && [ "$CUR" -lt 1048576 ] 2>/dev/null; then
+            echo ""
+            warn "检测到代理服务 ${svc}.service 的 LimitNOFILE=${CUR} 偏低"
+            echo -e "  ${DIM}fs.file-max 已抬高，但单进程 fd 上限受 systemd LimitNOFILE 限制${NC}"
+            read -rp "  是否为 ${svc} 写入 LimitNOFILE=1048576 的 drop-in？(y/N，默认N): " DOLN
+            [ -z "$DOLN" ] && DOLN="n"
+            if echo "$DOLN" | grep -qiE '^y(es)?$'; then
+                local DROPDIR="/etc/systemd/system/${svc}.service.d"
+                mkdir -p "$DROPDIR" 2>/dev/null
+                printf '[Service]\nLimitNOFILE=1048576\n' > "${DROPDIR}/99-nofile.conf"
+                systemctl daemon-reload 2>/dev/null
+                info "已写入 ${DROPDIR}/99-nofile.conf，重启 ${svc} 后生效：systemctl restart ${svc}"
+            fi
+        fi
+    done
+    [ "$found" -eq 0 ] && return 0
+}
+
 bbr_confirm_apply() {
     local RMEM=$1 WMEM=$2 TCP_MEM=$3 NOTSENT=$4 ADV_WIN=$5 \
           MIN_FREE=$6 SWAP=$7 TCP_RMEM_DEFAULT=$8 \
@@ -426,6 +519,9 @@ bbr_confirm_apply() {
     CONFIG=$(bbr_generate_config "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT" "$PROFILE_NAME")
     [ "$PROFILE_NAME" = "relay" ] || [ "$PROFILE_NAME" = "landing" ] || [ "$PROFILE_NAME" = "line_landing" ] && ensure_conntrack_module
     bbr_apply_sysctl "$CONFIG"
+    case "$PROFILE_NAME" in
+        relay|landing|line_landing) bbr_check_limitnofile ;;
+    esac
     echo ""
     info "BBR TCP 调优配置完成 ✓"
     warn "建议配合限速设置使用，避免 Retr 爆炸"
@@ -435,13 +531,15 @@ bbr_confirm_apply() {
 bbr_auto_calc() {
     local MEM_MB=$1 LAT_MS=$2 BW_MBPS=$3 MEM_LBL=$4 LAT_LBL=$5 BW_LBL=$6
 
-    local BW_MBS=$(( BW_MBPS / 8 ))
-    local BDP_MB=$(( BW_MBS * LAT_MS / 1000 ))
+    # 合并为单表达式避免双重整数截断：
+    # 旧写法 BW/8 再 ×LAT/1000 两次取整，低带宽×低延迟会被归零（显示 BDP 0MB）
+    local BDP_MB=$(( BW_MBPS * LAT_MS / 8000 ))
     local BUF_CALC=$(( BDP_MB * 3 / 2 ))
 
     local RMEM WMEM ADV_WIN NOTSENT TCP_RMEM_DEFAULT
     if   [ "$BUF_CALC" -le 10 ];  then RMEM=12582912;   WMEM=12582912;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
     elif [ "$BUF_CALC" -le 20 ];  then RMEM=20971520;   WMEM=20971520;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
+    elif [ "$BUF_CALC" -le 32 ];  then RMEM=33554432;   WMEM=33554432;   ADV_WIN=2; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576
     elif [ "$BUF_CALC" -le 40 ];  then RMEM=41943040;   WMEM=41943040;   ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576
     elif [ "$BUF_CALC" -le 64 ];  then RMEM=67108864;   WMEM=67108864;   ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=1048576
     elif [ "$BUF_CALC" -le 128 ]; then RMEM=134217728;  WMEM=134217728;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=2097152
@@ -600,29 +698,29 @@ bbr_menu_manual() {
     case "$PROFILE" in
         relay)
             # 中转机：中等缓冲足够，并发为主
-            if   [ "$MEM_MB" -le 1024 ]; then RECOMMEND="推荐 4 (40MB) 或 5 (64MB)"
-            elif [ "$MEM_MB" -le 2048 ]; then RECOMMEND="推荐 5 (64MB) 或 6 (128MB)"
-            elif [ "$MEM_MB" -le 4096 ]; then RECOMMEND="推荐 6 (128MB)"
-            else                              RECOMMEND="推荐 7 (256MB)"
+            if   [ "$MEM_MB" -le 1024 ]; then RECOMMEND="推荐 4 (32MB) 或 5 (40MB)"
+            elif [ "$MEM_MB" -le 2048 ]; then RECOMMEND="推荐 6 (64MB) 或 7 (128MB)"
+            elif [ "$MEM_MB" -le 4096 ]; then RECOMMEND="推荐 7 (128MB)"
+            else                              RECOMMEND="推荐 8 (256MB)"
             fi ;;
         landing)
             # 落地机：大缓冲吃满带宽
-            if   [ "$MEM_MB" -le 1024 ]; then RECOMMEND="推荐 5 (64MB)"
-            elif [ "$MEM_MB" -le 2048 ]; then RECOMMEND="推荐 6 (128MB)"
-            elif [ "$MEM_MB" -le 4096 ]; then RECOMMEND="推荐 7 (256MB)"
-            elif [ "$MEM_MB" -le 8192 ]; then RECOMMEND="推荐 8 (512MB)"
-            else                              RECOMMEND="推荐 8 (512MB) 或 9 (1024MB)"
+            if   [ "$MEM_MB" -le 1024 ]; then RECOMMEND="推荐 6 (64MB)"
+            elif [ "$MEM_MB" -le 2048 ]; then RECOMMEND="推荐 7 (128MB)"
+            elif [ "$MEM_MB" -le 4096 ]; then RECOMMEND="推荐 8 (256MB)"
+            elif [ "$MEM_MB" -le 8192 ]; then RECOMMEND="推荐 9 (512MB)"
+            else                              RECOMMEND="推荐 9 (512MB) 或 10 (1024MB)"
             fi ;;
         line_landing)
             # 线路落地机：低延迟优先，缓冲不用大
-            if   [ "$MEM_MB" -le 1024 ]; then RECOMMEND="推荐 3 (20MB) 或 4 (40MB)"
-            elif [ "$MEM_MB" -le 2048 ]; then RECOMMEND="推荐 4 (40MB) 或 5 (64MB)"
-            else                              RECOMMEND="推荐 5 (64MB) 或 6 (128MB)"
+            if   [ "$MEM_MB" -le 1024 ]; then RECOMMEND="推荐 3 (20MB) 或 4 (32MB)"
+            elif [ "$MEM_MB" -le 2048 ]; then RECOMMEND="推荐 4 (32MB) 或 6 (64MB)"
+            else                              RECOMMEND="推荐 6 (64MB) 或 7 (128MB)"
             fi ;;
         default)
             if   [ "$MEM_MB" -le 768 ];  then RECOMMEND="推荐 2 (16MB) 或 3 (20MB)"
-            elif [ "$MEM_MB" -le 2048 ]; then RECOMMEND="推荐 4 (40MB) 或 5 (64MB)"
-            else                              RECOMMEND="推荐 5 (64MB) 或 6 (128MB)"
+            elif [ "$MEM_MB" -le 2048 ]; then RECOMMEND="推荐 4 (32MB) 或 6 (64MB)"
+            else                              RECOMMEND="推荐 6 (64MB) 或 7 (128MB)"
             fi ;;
     esac
 
@@ -634,28 +732,30 @@ bbr_menu_manual() {
     echo -e "  ${GREEN}1${NC}) 12 MB    — 低带宽 / 低延迟"
     echo -e "  ${GREEN}2${NC}) 16 MB    — 小内存保守"
     echo -e "  ${GREEN}3${NC}) 20 MB    — 中低带宽"
-    echo -e "  ${GREEN}4${NC}) 40 MB    — 中等带宽（1G）"
-    echo -e "  ${GREEN}5${NC}) 64 MB    — 高带宽（1G+ 跨境）"
-    echo -e "  ${GREEN}6${NC}) 128 MB   — 超高带宽（2G/高延迟）"
-    echo -e "  ${GREEN}7${NC}) 256 MB   — 万兆 / 跨洋（5G/100ms）"
-    echo -e "  ${GREEN}8${NC}) 512 MB   — 万兆 / 长距离（10G/100ms）"
-    echo -e "  ${GREEN}9${NC}) 1024 MB  — 极限（10G+/200ms+，需 8G+ 内存）"
+    echo -e "  ${GREEN}4${NC}) 32 MB    — 1G 跨境甜点区（~150ms BDP，推荐）"
+    echo -e "  ${GREEN}5${NC}) 40 MB    — 中等带宽（1G）"
+    echo -e "  ${GREEN}6${NC}) 64 MB    — 高带宽（1G+ 跨境）"
+    echo -e "  ${GREEN}7${NC}) 128 MB   — 超高带宽（2G/高延迟）"
+    echo -e "  ${GREEN}8${NC}) 256 MB   — 万兆 / 跨洋（5G/100ms）"
+    echo -e "  ${GREEN}9${NC}) 512 MB   — 万兆 / 长距离（10G/100ms）"
+    echo -e "  ${GREEN}10${NC}) 1024 MB — 极限（10G+/200ms+，需 8G+ 内存）"
     echo -e "  ${RED}0${NC}) 返回   ${RED}00${NC}) 退出脚本"
     echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
     echo ""
-    read -rp "  请选择 [0-9]: " CH
+    read -rp "  请选择 [0-10]: " CH
 
     local RMEM WMEM BUF_LBL
     case "$CH" in
-        1) RMEM=12582912;   BUF_LBL=12   ;;
-        2) RMEM=16777216;   BUF_LBL=16   ;;
-        3) RMEM=20971520;   BUF_LBL=20   ;;
-        4) RMEM=41943040;   BUF_LBL=40   ;;
-        5) RMEM=67108864;   BUF_LBL=64   ;;
-        6) RMEM=134217728;  BUF_LBL=128  ;;
-        7) RMEM=268435456;  BUF_LBL=256  ;;
-        8) RMEM=536870912;  BUF_LBL=512  ;;
-        9) RMEM=1073741824; BUF_LBL=1024 ;;
+        1)  RMEM=12582912;   BUF_LBL=12   ;;
+        2)  RMEM=16777216;   BUF_LBL=16   ;;
+        3)  RMEM=20971520;   BUF_LBL=20   ;;
+        4)  RMEM=33554432;   BUF_LBL=32   ;;
+        5)  RMEM=41943040;   BUF_LBL=40   ;;
+        6)  RMEM=67108864;   BUF_LBL=64   ;;
+        7)  RMEM=134217728;  BUF_LBL=128  ;;
+        8)  RMEM=268435456;  BUF_LBL=256  ;;
+        9)  RMEM=536870912;  BUF_LBL=512  ;;
+        10) RMEM=1073741824; BUF_LBL=1024 ;;
         0) return ;;
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项"; return ;;
@@ -686,13 +786,13 @@ bbr_menu_manual() {
             || { [ "$BUF_LBL" -le 256 ] && TCP_RMEM_DEFAULT=2097152 || TCP_RMEM_DEFAULT=4194304; }
             ;;
         line_landing)
-            # 线路落地机：窗口偏小、NOTSENT 极小（响应优先）
-            ADV_WIN=1; NOTSENT=131072
+            # 线路落地机：NOTSENT 极小（响应优先），adv_win=2 保证源站→落地高 BDP 接收
+            ADV_WIN=2; NOTSENT=131072
             [ "$BUF_LBL" -le 64 ] && TCP_RMEM_DEFAULT=1048576 || TCP_RMEM_DEFAULT=2097152
             ;;
         default)
             # 通用：跟着缓冲区档位走
-            if   [ "$BUF_LBL" -le 20 ];  then ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
+            if   [ "$BUF_LBL" -le 32 ];  then ADV_WIN=2; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576
             elif [ "$BUF_LBL" -le 64 ];  then ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=1048576
             elif [ "$BUF_LBL" -le 256 ]; then ADV_WIN=3; NOTSENT=1048576; TCP_RMEM_DEFAULT=2097152
             else                              ADV_WIN=3; NOTSENT=2097152; TCP_RMEM_DEFAULT=4194304
@@ -731,13 +831,14 @@ bbr_menu_tc() {
     fi
 
     local DEV; DEV=$(ip route | awk '/^default/{print $5}')
-    local TX_Q; TX_Q=$(find /sys/class/net/"$DEV"/queues/ -maxdepth 1 -name "tx-*" 2>/dev/null | wc -l)
-    local IS_MQ=0
-    { tc qdisc show dev "$DEV" 2>/dev/null | grep -q "qdisc mq" || [ "$TX_Q" -gt 1 ]; } && IS_MQ=1
-    local CUR; CUR=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oE '(maxrate|rate) [^ ]+' | head -1 | awk '{print $2}')
+    local QTYPE; QTYPE=$(tc qdisc show dev "$DEV" 2>/dev/null | awk 'NR==1{print $2}')
+    [ -z "$QTYPE" ] && QTYPE="未知"
+    # 当前限速：优先取 htb class 的 rate，其次 fq maxrate
+    local CUR; CUR=$(tc class show dev "$DEV" 2>/dev/null | grep -oE 'rate [^ ]+' | head -1 | awk '{print $2}')
+    [ -z "$CUR" ] && CUR=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oE 'maxrate [^ ]+' | head -1 | awk '{print $2}')
     [ -z "$CUR" ] && CUR="未设置"
 
-    echo -e "  网卡：${BOLD}${DEV}${NC}  类型：${BOLD}$([ "$IS_MQ" -eq 1 ] && echo "mq多队列" || echo "单队列")${NC}  当前限速：${BOLD}${CUR}${NC}"
+    echo -e "  网卡：${BOLD}${DEV}${NC}  当前 qdisc：${BOLD}${QTYPE}${NC}  当前限速：${BOLD}${CUR}${NC}"
     echo ""
     echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
     echo -e "  ${GREEN}1${NC}) 200 Mbps"
@@ -773,12 +874,8 @@ bbr_menu_tc() {
     esac
 
     if [ "$RATE" -eq 0 ]; then
-        if [ "$IS_MQ" -eq 1 ]; then
-            tc qdisc del dev "$DEV" root 2>/dev/null
-            tc qdisc add dev "$DEV" root mq 2>/dev/null
-        else
-            tc qdisc del dev "$DEV" root 2>/dev/null
-        fi
+        # 删除 root qdisc，内核会自动恢复默认（mq/fq_codel 等），无需手动重建 mq
+        tc qdisc del dev "$DEV" root 2>/dev/null
         svc_disable tc-fq
         rm -f "$SERVICE_TC"
         svc_daemon_reload
@@ -792,16 +889,7 @@ bbr_menu_tc() {
 # 检测是否在 LXC 容器内
 
 # 检测 OpenVZ / LXC 等受限容器
-is_openvz() {
-    [ -f /proc/vz/veinfo ] && return 0
-    grep -qaE 'openvz|lxc' /proc/1/environ 2>/dev/null && return 0
-    grep -qaE 'openvz|lxc' /proc/1/cgroup 2>/dev/null && return 0
-    return 1
-}
 
-is_lxc() {
-    grep -qa "lxc" /proc/1/environ 2>/dev/null     || [ -f /run/systemd/container ]     || grep -qa "container=lxc" /proc/1/environ 2>/dev/null     || { [ -f /proc/1/cgroup ] && grep -qa "lxc" /proc/1/cgroup 2>/dev/null; }
-}
 
 bbr_menu_initcwnd() {
     print_header "initcwnd 设置"
@@ -970,7 +1058,7 @@ volcano_tcp_profile() {
                 RMEM=268435456; BUF_MB=256;  TCP_MEM="262144 393216 786432"; MIN_FREE=131072
             fi
             WMEM=$RMEM
-            NOTSENT=131072; ADV_WIN=1; SWAP=5
+            NOTSENT=131072; ADV_WIN=2; SWAP=5
             TCP_RMEM_DEFAULT=1048576
             LABEL="线路落地机 — CN2/IPLC/直连用户/低延迟优先" ;;
         *) error "未知预设：$PROFILE"; return 1 ;;
@@ -983,6 +1071,9 @@ volcano_tcp_profile() {
     local CONFIG
     CONFIG=$(bbr_generate_config "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT" "$PROFILE")
     bbr_apply_sysctl "$CONFIG"
+    case "$PROFILE" in
+        relay|landing|line_landing) bbr_check_limitnofile ;;
+    esac
     info "TCP 预设「${PROFILE}」已应用 ✓"
 }
 
@@ -1049,11 +1140,6 @@ bbr_smart_wizard() {
 
 
 # ── 检测是否有 sysctl 写入权限 ───────────────────────────
-has_sysctl_write() {
-    # 尝试写一个无害的参数测试权限
-    sysctl -w net.ipv4.tcp_fin_timeout=10 > /dev/null 2>&1 && return 0
-    return 1
-}
 
 # ── 检测内核是否支持 BBR ─────────────────────────────────
 bbr_check_kernel() {
