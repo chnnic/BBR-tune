@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.5.5 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.5.6 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -220,11 +220,15 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_keepalive_time = 60
+
+# ── UDP 缓冲（QUIC / Hysteria2 / TUIC 代理）──
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
 ```
 
 ### 场景化预设额外参数
 
-**中转机 / 落地机 / 线路落地机 共有（5 项转发参数）：**
+**中转机 / 落地机 / 线路落地机 共有（8 项转发/并发参数）：**
 
 ```ini
 net.ipv4.ip_forward = 1
@@ -232,7 +236,12 @@ net.ipv6.conf.all.forwarding = 1
 net.core.somaxconn = 8192
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.ip_local_port_range = 10000 65535   # 扩大出站端口，防中转高并发端口耗尽
+net.ipv4.tcp_max_tw_buckets = 500000         # 容纳更多 TIME_WAIT
+fs.file-max = 1048576                         # 高并发 fd 上限
 ```
+
+> **fd 上限提醒：** `fs.file-max` 仅系统总上限；单个代理进程的 fd 受 systemd `LimitNOFILE` 限制。应用场景预设后，脚本会自动检测常见代理 service（xray / sing-box / hysteria / tuic / v2ray / trojan / mihomo 等）的 `LimitNOFILE`，偏低时询问是否写入 `LimitNOFILE=1048576` 的 drop-in。
 
 **仅中转机额外（3 项 conntrack）：**
 
@@ -349,6 +358,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.5.6** | 新增 UDP 缓冲（QUIC/Hysteria2/TUIC）；场景预设加端口范围 + tw_buckets + file-max 防端口/fd 耗尽；应用后检测代理 service LimitNOFILE 并询问写 drop-in |
 | **同步 V3.5.5** | 限速改 htb 整形 + fq pacing（多队列网卡保留 BBR pacing）；burst 随速率缩放；切换预设复位残留场景键；新增 32MB 缓冲档；修 BDP 双截断；line_landing ADV_WIN 1→2；加 bash 解释器守卫 |
 | V3.5.2 | 手动配置加场景选择前置层（中转/落地/线路落地各自调优） |
 | V3.5.1 | 场景预设注入转发 + conntrack 参数，自动 modprobe |
