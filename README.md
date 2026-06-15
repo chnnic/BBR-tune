@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.5.8 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.5.9 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
