@@ -2,8 +2,9 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.5.8）
+#  从 VPS 开荒脚本独立提取（同步至 V3.5.9）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.5.9: 默认网卡检测改用 ip route get（多默认路由/策略路由更准）
 #  V3.5.8: 修复独立版缺失 4 个辅助函数(ensure_conntrack_module/svc_daemon_reload/
 #          svc_enable/svc_disable)，限速/场景预设/initcwnd 独立运行不再中断
 #  V3.5.6: 新增 UDP 缓冲(QUIC/Hysteria2)、场景预设加端口范围/tw_buckets/file-max
@@ -78,6 +79,15 @@ svc_disable() {
     elif command -v rc-update &>/dev/null; then
         rc-update del "$SVC" 2>/dev/null
     fi
+}
+
+# 获取默认出口网卡：ip route get 比 awk '/^default/' 更准，失败回退旧法
+default_iface() {
+    local DEV
+    DEV=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    [ -z "$DEV" ] && DEV=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    [ -z "$DEV" ] && DEV=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+    echo "$DEV"
 }
 
 # ── 字符长度（中文按 2，英文按 1）─────────────────────────
@@ -196,7 +206,7 @@ SYSCTL_FILE="/etc/sysctl.d/99-vps-bbr.conf"
 
 # ── 状态显示 ──────────────────────────────────────────────
 bbr_print_status() {
-    local DEV; DEV=$(ip route | awk '/^default/{print $5}')
+    local DEV; DEV=$(default_iface)
     local RATE; RATE=$(tc qdisc show dev "$DEV" 2>/dev/null | grep -oE '(maxrate|rate) [^ ]+' | head -1 | awk '{print $2}')
     [ -z "$RATE" ] && RATE="未设置"
     local BBR; BBR=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
@@ -367,7 +377,7 @@ bbr_apply_sysctl() {
 # ── 应用 tc 限速 ──────────────────────────────────────────
 bbr_apply_tc() {
     local RATE="$1"
-    local DEV; DEV=$(ip route | awk '/^default/{print $5}')
+    local DEV; DEV=$(default_iface)
     [ -z "$DEV" ] && { error "无法确定默认出口网卡"; return 1; }
 
     # burst/cburst 随速率缩放（约 8ms 量级，≈ RATE KB），下限 32KB。
@@ -863,7 +873,7 @@ bbr_menu_tc() {
         return
     fi
 
-    local DEV; DEV=$(ip route | awk '/^default/{print $5}')
+    local DEV; DEV=$(default_iface)
     local QTYPE; QTYPE=$(tc qdisc show dev "$DEV" 2>/dev/null | awk 'NR==1{print $2}')
     [ -z "$QTYPE" ] && QTYPE="未知"
     # 当前限速：优先取 htb class 的 rate，其次 fq maxrate
@@ -941,7 +951,7 @@ bbr_menu_initcwnd() {
     fi
 
     local DEV GW ONLINK
-    DEV=$(ip route | awk '/^default/{print $5}')
+    DEV=$(default_iface)
     GW=$(ip route | awk '/^default/{print $3}')
     ONLINK=$(ip route | grep "^default" | grep -q "onlink" && echo "onlink" || echo "")
     local CUR; CUR=$(ip route show | grep "^default" | grep -oE 'initcwnd [0-9]+' | awk '{print $2}')
