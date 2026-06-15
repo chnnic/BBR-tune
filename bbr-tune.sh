@@ -2,8 +2,10 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.5.7）
+#  从 VPS 开荒脚本独立提取（同步至 V3.5.8）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.5.8: 修复独立版缺失 4 个辅助函数(ensure_conntrack_module/svc_daemon_reload/
+#          svc_enable/svc_disable)，限速/场景预设/initcwnd 独立运行不再中断
 #  V3.5.6: 新增 UDP 缓冲(QUIC/Hysteria2)、场景预设加端口范围/tw_buckets/file-max
 #          防高并发端口耗尽、应用场景预设后检测代理 service LimitNOFILE
 #  V3.5.5: 限速改 htb 整形+fq pacing(保 BBR)、burst 随速率缩放、
@@ -44,6 +46,37 @@ error() { echo -e "  ${RED}✘${NC}  $1"; }
 safe_clear() {
     if [ -n "${TERM:-}" ] && [ "$TERM" != "dumb" ]; then
         clear 2>/dev/null || true
+    fi
+}
+
+# ── 服务管理 / 内核模块辅助（独立运行所需，从主脚本同步）──
+ensure_conntrack_module() {
+    lsmod 2>/dev/null | grep -q "^nf_conntrack" && return 0
+    modprobe nf_conntrack 2>/dev/null
+}
+
+svc_daemon_reload() {
+    command -v systemctl &>/dev/null && systemctl daemon-reload 2>/dev/null || true
+}
+
+svc_enable() {
+    local SVC="$1"
+    if command -v systemctl &>/dev/null && pidof systemd &>/dev/null; then
+        systemctl unmask "$SVC" 2>/dev/null || true
+        systemctl enable "$SVC" --quiet 2>/dev/null || true
+    elif command -v rc-update &>/dev/null; then
+        rc-update add "$SVC" default 2>/dev/null
+    elif command -v update-rc.d &>/dev/null; then
+        update-rc.d "$SVC" enable 2>/dev/null
+    fi
+}
+
+svc_disable() {
+    local SVC="$1"
+    if command -v systemctl &>/dev/null; then
+        systemctl disable "$SVC" --quiet 2>/dev/null
+    elif command -v rc-update &>/dev/null; then
+        rc-update del "$SVC" 2>/dev/null
     fi
 }
 
