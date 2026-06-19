@@ -6,6 +6,8 @@
 
 > **运行依赖：** 需 **bash**（使用了数组 / `[[ ]]` / here-string 等）。Alpine 需 `apk add bash`，OpenWrt 需 `opkg install bash`。脚本头部带解释器守卫，非 bash 环境会自动切换或 fail-fast 提示。
 
+> **维护说明：** 本工具从 `SSH-Hardening` 的 BBR 模块同步提取，版本同步规则见 [SYNC_BBR.md](SYNC_BBR.md)。
+
 ---
 
 ## 快速开始
