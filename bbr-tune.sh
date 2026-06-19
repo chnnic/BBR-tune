@@ -33,7 +33,6 @@ fi
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
 YELLOW=$'\033[1;33m'
-BLUE=$'\033[0;34m'
 CYAN=$'\033[0;36m'
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
@@ -118,7 +117,6 @@ box_title() {
     printf "\n"
 }
 box_line() {
-    local PLAIN="$1"
     local COLORED="${2:-$1}"
     echo -e "$COLORED"
 }
@@ -246,7 +244,8 @@ bbr_print_status() {
 # ── 备份 sysctl ───────────────────────────────────────────
 bbr_backup_sysctl() {
     if [ -f "$SYSCTL_FILE" ]; then
-        local BAK="${SYSCTL_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        local BAK
+        BAK="${SYSCTL_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
         cp "$SYSCTL_FILE" "$BAK"
         info "已备份至：$BAK"
     fi
@@ -356,7 +355,7 @@ bbr_apply_sysctl() {
     echo "$CONFIG" > "$SYSCTL_FILE"
 
     # 逐行应用，跳过不支持的参数（Alpine 部分内核不支持 default_qdisc 等）
-    local FAILED=0 SKIPPED=0
+    local SKIPPED=0
     while IFS= read -r line; do
         # 跳过注释和空行
         echo "$line" | grep -qE '^\s*#|^\s*$' && continue
@@ -1216,7 +1215,6 @@ bbr_check_kernel() {
     # Alpine 上尝试安装内核模块包
     if command -v apk &>/dev/null; then
         warn "tcp_bbr 模块未加载，尝试安装内核模块..."
-        local KFULL; KFULL=$(uname -r)
         apk add --no-cache "linux-lts-dev" 2>/dev/null             || apk add --no-cache "linux-virt" 2>/dev/null || true
         modprobe tcp_bbr 2>/dev/null && { info "tcp_bbr 模块已加载 ✓"; return 0; }
     fi
