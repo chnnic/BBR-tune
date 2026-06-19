@@ -2,8 +2,9 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.6.2）
+#  从 VPS 开荒脚本独立提取（同步至 V3.6.3）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.6.3: 新增脚本更新模块；新增 bbr 快捷键安装/刷新功能
 #  V3.6.2: BBR 模块增强：sysctl 权限探测无副作用、tc service 动态找 tc/网卡、
 #          不支持 sysctl 参数注释持久化、Alpine 内核包安装需确认、增加诊断入口
 #  V3.6.1: 修复 initcwnd 在无网关默认路由环境下设置失败
@@ -39,6 +40,9 @@ CYAN=$'\033[0;36m'
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
 NC=$'\033[0m'
+
+SCRIPT_URL="https://raw.githubusercontent.com/chnnic/BBR-tune/refs/heads/main/bbr-tune.sh"
+INSTALL_PATH="/usr/local/bin/bbr"
 
 # ── 提示函数 ──────────────────────────────────────────────
 info()  { echo -e "  ${GREEN}✔${NC}  $1"; }
@@ -156,6 +160,96 @@ pkg_install() {
     else
         return 1
     fi
+}
+
+download_script() {
+    local OUT="$1"
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$SCRIPT_URL" -o "$OUT"
+    elif command -v wget &>/dev/null; then
+        wget -qO "$OUT" "$SCRIPT_URL"
+    else
+        error "未找到 curl 或 wget，无法下载脚本"
+        return 1
+    fi
+}
+
+resolve_self_path() {
+    local SRC="${BASH_SOURCE[0]:-$0}"
+    if command -v readlink &>/dev/null; then
+        readlink -f "$SRC" 2>/dev/null && return 0
+    fi
+    echo "$SRC"
+}
+
+bbr_install_shortcut() {
+    print_header "快捷键设置"
+    local SRC TMP
+    SRC=$(resolve_self_path)
+    TMP="/tmp/bbr-tune-install.$$"
+
+    mkdir -p "$(dirname "$INSTALL_PATH")" 2>/dev/null || {
+        error "无法创建 $(dirname "$INSTALL_PATH")"
+        return 1
+    }
+
+    if [ -f "$SRC" ] && [ -r "$SRC" ]; then
+        cp "$SRC" "$TMP" || { error "无法复制当前脚本"; return 1; }
+    else
+        warn "当前运行方式不是普通文件，改为下载最新版本安装"
+        download_script "$TMP" || { rm -f "$TMP"; return 1; }
+    fi
+
+    if ! bash -n "$TMP"; then
+        rm -f "$TMP"
+        error "脚本语法校验失败，已取消安装"
+        return 1
+    fi
+
+    chmod 755 "$TMP"
+    mv "$TMP" "$INSTALL_PATH" || { rm -f "$TMP"; error "写入 ${INSTALL_PATH} 失败"; return 1; }
+    info "快捷键已设置：输入 bbr 即可启动"
+    echo -e "  ${DIM}${INSTALL_PATH}${NC}"
+}
+
+bbr_self_update() {
+    print_header "脚本更新"
+    local TMP TARGET BACKUP
+    TMP="/tmp/bbr-tune-update.$$"
+    TARGET=""
+
+    download_script "$TMP" || { rm -f "$TMP"; return 1; }
+    if ! bash -n "$TMP"; then
+        rm -f "$TMP"
+        error "下载的新脚本语法校验失败，已取消更新"
+        return 1
+    fi
+
+    if [ -f "$INSTALL_PATH" ]; then
+        TARGET="$INSTALL_PATH"
+    else
+        TARGET=$(resolve_self_path)
+    fi
+
+    if [ ! -f "$TARGET" ] || [ ! -w "$TARGET" ]; then
+        warn "当前脚本不适合原地更新，将安装/更新到 ${INSTALL_PATH}"
+        TARGET="$INSTALL_PATH"
+        mkdir -p "$(dirname "$INSTALL_PATH")" 2>/dev/null || {
+            rm -f "$TMP"
+            error "无法创建 $(dirname "$INSTALL_PATH")"
+            return 1
+        }
+    fi
+
+    if [ -f "$TARGET" ]; then
+        BACKUP="${TARGET}.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$TARGET" "$BACKUP" 2>/dev/null && info "已备份旧脚本：${BACKUP}"
+    fi
+
+    chmod 755 "$TMP"
+    mv "$TMP" "$TARGET" || { rm -f "$TMP"; error "更新 ${TARGET} 失败"; return 1; }
+    info "脚本已更新：${TARGET}"
+    [ "$TARGET" = "$INSTALL_PATH" ] && info "快捷键可用：bbr"
 }
 
 # ── 编辑器自动选择 ────────────────────────────────────────
@@ -1323,10 +1417,11 @@ bbr_menu() {
         echo -e "  ${GREEN}4${NC}) 限速设置（tc）   ${GREEN}5${NC}) initcwnd 设置"
         echo -e "  ${GREEN}6${NC}) 备份 TCP 配置    ${GREEN}7${NC}) 还原 TCP 配置"
         echo -e "  ${GREEN}8${NC}) BBR 诊断"
+        echo -e "  ${GREEN}9${NC}) 更新脚本        ${GREEN}10${NC}) 设置 bbr 快捷键"
         echo -e "  ${RED}0${NC}) 返回主菜单        ${RED}00${NC}) 退出脚本"
         echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
         echo ""
-        read -rp "  请选择 [0-8]: " CH
+        read -rp "  请选择 [0-10]: " CH
 
         case "$CH" in
             1) bbr_smart_wizard ;;
@@ -1337,6 +1432,8 @@ bbr_menu() {
             6) bbr_backup_sysctl ;;
             7) bbr_restore_sysctl ;;
             8) bbr_diagnose ;;
+            9) bbr_self_update ;;
+            10) bbr_install_shortcut ;;
             0) return ;;
             00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
             *) warn "无效选项"; sleep 1; continue ;;
