@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.6.1 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.6.2 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -44,6 +44,7 @@ sudo ./bbr-tune.sh
   ──────────────────────────────────────
   4) 限速设置（tc）   5) initcwnd 设置
   6) 备份 TCP 配置    7) 还原 TCP 配置
+  8) BBR 诊断
   0) 返回主菜单        00) 退出脚本
 ```
 
@@ -360,6 +361,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.6.2** | BBR 模块增强：sysctl 权限探测不再改变 TCP 参数；tc 限速服务运行时动态识别 `tc` 路径和默认网卡；不支持的 sysctl 参数会在持久化文件中注释；Alpine 内核包安装改为确认后执行；新增 BBR 诊断入口 |
 | **同步 V3.6.1** | 修复 `initcwnd` 在无网关默认路由环境下设置失败 |
 | **同步 V3.5.8** | 修复独立版缺失 4 个辅助函数（`ensure_conntrack_module` / `svc_daemon_reload` / `svc_enable` / `svc_disable`），独立运行限速 / 场景预设 / initcwnd 不再中断 |
 | **同步 V3.5.6** | 新增 UDP 缓冲（QUIC/Hysteria2/TUIC）；场景预设加端口范围 + tw_buckets + file-max 防端口/fd 耗尽；应用后检测代理 service LimitNOFILE 并询问写 drop-in |

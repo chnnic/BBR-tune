@@ -2,8 +2,10 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.6.1）
+#  从 VPS 开荒脚本独立提取（同步至 V3.6.2）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.6.2: BBR 模块增强：sysctl 权限探测无副作用、tc service 动态找 tc/网卡、
+#          不支持 sysctl 参数注释持久化、Alpine 内核包安装需确认、增加诊断入口
 #  V3.6.1: 修复 initcwnd 在无网关默认路由环境下设置失败
 #  V3.5.9: 默认网卡检测改用 ip route get（多默认路由/策略路由更准）
 #  V3.5.8: 修复独立版缺失 4 个辅助函数(ensure_conntrack_module/svc_daemon_reload/
@@ -192,7 +194,10 @@ is_lxc() {
 }
 
 has_sysctl_write() {
-    sysctl -w net.ipv4.tcp_fin_timeout=10 > /dev/null 2>&1 && return 0
+    local CUR
+    CUR=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null) || return 1
+    [ -n "$CUR" ] || return 1
+    sysctl -w "net.ipv4.tcp_fin_timeout=${CUR}" > /dev/null 2>&1 && return 0
     return 1
 }
 
@@ -352,24 +357,31 @@ bbr_apply_sysctl() {
         fi
     fi
 
-    echo "$CONFIG" > "$SYSCTL_FILE"
-
-    # 逐行应用，跳过不支持的参数（Alpine 部分内核不支持 default_qdisc 等）
-    local SKIPPED=0
+    # 逐行应用并生成持久化文件；不支持的参数写成注释，避免重启时 sysctl 报错。
+    local SKIPPED=0 TMP_FILE
+    TMP_FILE="${SYSCTL_FILE}.tmp.$$"
+    : > "$TMP_FILE" || { error "无法写入临时配置：$TMP_FILE"; return 1; }
     while IFS= read -r line; do
-        # 跳过注释和空行
-        echo "$line" | grep -qE '^\s*#|^\s*$' && continue
+        if echo "$line" | grep -qE '^\s*#|^\s*$'; then
+            echo "$line" >> "$TMP_FILE"
+            continue
+        fi
         local KEY VAL
         KEY=$(echo "$line" | cut -d= -f1 | tr -d ' ')
         VAL=$(echo "$line" | cut -d= -f2- | sed 's/^ //')
-        if ! sysctl -w "${KEY}=${VAL}" > /dev/null 2>&1; then
+        if sysctl -w "${KEY}=${VAL}" > /dev/null 2>&1; then
+            echo "$line" >> "$TMP_FILE"
+        else
             warn "跳过不支持的参数：${KEY}"
+            echo "# skipped unsupported: $line" >> "$TMP_FILE"
             SKIPPED=$(( SKIPPED + 1 ))
         fi
-    done < "$SYSCTL_FILE"
+    done <<< "$CONFIG"
+
+    mv "$TMP_FILE" "$SYSCTL_FILE" || { rm -f "$TMP_FILE"; error "无法更新 ${SYSCTL_FILE}"; return 1; }
 
     if [ "$SKIPPED" -gt 0 ]; then
-        warn "共跳过 ${SKIPPED} 个不支持的参数（已记录在配置文件，重启后不影响）"
+        warn "共跳过 ${SKIPPED} 个不支持的参数（已在配置文件中注释，重启后不报错）"
     fi
     info "sysctl 配置已应用到 ${SYSCTL_FILE} ✓"
 }
@@ -379,6 +391,9 @@ bbr_apply_tc() {
     local RATE="$1"
     local DEV; DEV=$(default_iface)
     [ -z "$DEV" ] && { error "无法确定默认出口网卡"; return 1; }
+    local TC_BIN
+    TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
+    [ -x "$TC_BIN" ] || { error "tc 命令不可用，请先安装 iproute2"; return 1; }
 
     # burst/cburst 随速率缩放（约 8ms 量级，≈ RATE KB），下限 32KB。
     # 固定 burst 会在高速率下令牌饥饿，导致跑不满设定速率。
@@ -388,13 +403,13 @@ bbr_apply_tc() {
     # 关键：用 htb 做「聚合」整形（真正硬上限），叶子挂 fq 保留 BBR pacing。
     # 旧版多队列网卡用 root tbf 会顶掉 fq、废掉 BBR pacing，且单纯 fq maxrate
     # 只能限「每流」不能限聚合。htb(整形) + fq(pacing) 才同时满足两者。
-    tc qdisc del dev "$DEV" root 2>/dev/null
-    if ! tc qdisc add dev "$DEV" root handle 1: htb default 10 2>/dev/null \
-        || ! tc class add dev "$DEV" parent 1: classid 1:10 htb \
+    "$TC_BIN" qdisc del dev "$DEV" root 2>/dev/null
+    if ! "$TC_BIN" qdisc add dev "$DEV" root handle 1: htb default 10 2>/dev/null \
+        || ! "$TC_BIN" class add dev "$DEV" parent 1: classid 1:10 htb \
                 rate "${RATE}mbit" ceil "${RATE}mbit" burst "${BURST_KB}kb" cburst "${BURST_KB}kb" 2>/dev/null \
-        || ! tc qdisc add dev "$DEV" parent 1:10 handle 100: fq maxrate "${RATE}mbit" 2>/dev/null; then
+        || ! "$TC_BIN" qdisc add dev "$DEV" parent 1:10 handle 100: fq maxrate "${RATE}mbit" 2>/dev/null; then
         error "tc 规则应用失败（内核可能缺 sch_htb / sch_fq 模块）"
-        tc qdisc del dev "$DEV" root 2>/dev/null
+        "$TC_BIN" qdisc del dev "$DEV" root 2>/dev/null
         return 1
     fi
 
@@ -405,7 +420,7 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c '/sbin/tc qdisc del dev ${DEV} root 2>/dev/null; /sbin/tc qdisc add dev ${DEV} root handle 1: htb default 10 && /sbin/tc class add dev ${DEV} parent 1: classid 1:10 htb rate ${RATE}mbit ceil ${RATE}mbit burst ${BURST_KB}kb cburst ${BURST_KB}kb && /sbin/tc qdisc add dev ${DEV} parent 1:10 handle 100: fq maxrate ${RATE}mbit'
+ExecStart=/bin/sh -c 'TC=\$(command -v tc || echo /sbin/tc); DEV=\$(ip route get 1.1.1.1 2>/dev/null | awk '"'"'{for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}'"'"'); [ -n "\$DEV" ] || DEV=\$(ip route 2>/dev/null | awk '"'"'/^default/{print \$5; exit}'"'"'); [ -n "\$DEV" ] || exit 1; "\$TC" qdisc del dev "\$DEV" root 2>/dev/null; "\$TC" qdisc add dev "\$DEV" root handle 1: htb default 10 && "\$TC" class add dev "\$DEV" parent 1: classid 1:10 htb rate ${RATE}mbit ceil ${RATE}mbit burst ${BURST_KB}kb cburst ${BURST_KB}kb && "\$TC" qdisc add dev "\$DEV" parent 1:10 handle 100: fq maxrate ${RATE}mbit'
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
@@ -1212,11 +1227,16 @@ bbr_check_kernel() {
         return 0
     fi
 
-    # Alpine 上尝试安装内核模块包
+    # Alpine 上安装/切换内核包通常需要重启，交给用户确认后再动系统包。
     if command -v apk &>/dev/null; then
-        warn "tcp_bbr 模块未加载，尝试安装内核模块..."
-        apk add --no-cache "linux-lts-dev" 2>/dev/null             || apk add --no-cache "linux-virt" 2>/dev/null || true
-        modprobe tcp_bbr 2>/dev/null && { info "tcp_bbr 模块已加载 ✓"; return 0; }
+        warn "tcp_bbr 模块未加载。Alpine 可能需要安装/切换内核包并重启。"
+        read -rp "  尝试安装 linux-lts 或 linux-virt？(y/N，默认N): " APK_KERNEL
+        [ -z "$APK_KERNEL" ] && APK_KERNEL="n"
+        if echo "$APK_KERNEL" | grep -qiE '^y(es)?$'; then
+            apk add --no-cache linux-lts 2>/dev/null || apk add --no-cache linux-virt 2>/dev/null || true
+            modprobe tcp_bbr 2>/dev/null && { info "tcp_bbr 模块已加载 ✓"; return 0; }
+            warn "内核包安装后通常需要 reboot 才会生效"
+        fi
     fi
 
     # 检查 sysctl 是否已设置 bbr（有些内核内置不需要模块）
@@ -1229,6 +1249,52 @@ bbr_check_kernel() {
     echo -e "  ${DIM}  apk add linux-lts && reboot${NC}"
     echo -e "  ${DIM}或检查：/proc/sys/net/ipv4/tcp_available_congestion_control${NC}"
     return 1
+}
+
+bbr_diagnose() {
+    print_header "BBR 诊断"
+    local DEV TC_BIN KERNEL CC AVAIL QDISC RATE SYSCTL_WRITABLE SERVICE_STATE
+    DEV=$(default_iface)
+    TC_BIN=$(command -v tc 2>/dev/null || true)
+    KERNEL=$(uname -r 2>/dev/null || echo "未知")
+    CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    AVAIL=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "未知")
+    QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    RATE="未设置"
+
+    if [ -n "$DEV" ] && [ -n "$TC_BIN" ]; then
+        RATE=$("$TC_BIN" class show dev "$DEV" 2>/dev/null | grep -oE 'rate [^ ]+' | head -1 | awk '{print $2}')
+        [ -z "$RATE" ] && RATE=$("$TC_BIN" qdisc show dev "$DEV" 2>/dev/null | grep -oE 'maxrate [^ ]+' | head -1 | awk '{print $2}')
+        [ -z "$RATE" ] && RATE="未设置"
+    fi
+
+    SYSCTL_WRITABLE="否"
+    has_sysctl_write && SYSCTL_WRITABLE="是"
+
+    SERVICE_STATE="未安装"
+    if command -v systemctl &>/dev/null && [ -f "$SERVICE_TC" ]; then
+        SERVICE_STATE=$(systemctl is-enabled tc-fq 2>/dev/null || echo "已安装未启用")
+    elif [ -f "$SERVICE_TC" ]; then
+        SERVICE_STATE="已安装"
+    fi
+
+    echo -e "  内核版本: ${BOLD}${KERNEL}${NC}"
+    echo -e "  默认网卡: ${BOLD}${DEV:-未知}${NC}"
+    echo -e "  tc 命令: ${BOLD}${TC_BIN:-未安装}${NC}"
+    echo -e "  拥塞算法: ${BOLD}${CC}${NC}"
+    echo -e "  可用算法: ${BOLD}${AVAIL}${NC}"
+    echo -e "  默认队列: ${BOLD}${QDISC}${NC}"
+    echo -e "  tc 限速: ${BOLD}${RATE}${NC}"
+    echo -e "  tc-fq 服务: ${BOLD}${SERVICE_STATE}${NC}"
+    echo -e "  sysctl 可写: ${BOLD}${SYSCTL_WRITABLE}${NC}"
+
+    [ "$CC" = "bbr" ] || warn "当前未启用 BBR 拥塞算法"
+    echo "$AVAIL" | grep -qw bbr || warn "可用拥塞算法里没有 bbr，可能需要升级/切换内核"
+    [ "$QDISC" = "fq" ] || warn "默认队列不是 fq，BBR pacing 可能不完整"
+    if [ -f "$SYSCTL_FILE" ] && grep -q '^# skipped unsupported:' "$SYSCTL_FILE"; then
+        warn "检测到不支持的 sysctl 参数已被注释："
+        grep '^# skipped unsupported:' "$SYSCTL_FILE" | sed 's/^/    /'
+    fi
 }
 
 bbr_menu() {
@@ -1256,10 +1322,11 @@ bbr_menu() {
         echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
         echo -e "  ${GREEN}4${NC}) 限速设置（tc）   ${GREEN}5${NC}) initcwnd 设置"
         echo -e "  ${GREEN}6${NC}) 备份 TCP 配置    ${GREEN}7${NC}) 还原 TCP 配置"
+        echo -e "  ${GREEN}8${NC}) BBR 诊断"
         echo -e "  ${RED}0${NC}) 返回主菜单        ${RED}00${NC}) 退出脚本"
         echo -e "  ${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"
         echo ""
-        read -rp "  请选择 [0-7]: " CH
+        read -rp "  请选择 [0-8]: " CH
 
         case "$CH" in
             1) bbr_smart_wizard ;;
@@ -1269,6 +1336,7 @@ bbr_menu() {
             5) bbr_menu_initcwnd ;;
             6) bbr_backup_sysctl ;;
             7) bbr_restore_sysctl ;;
+            8) bbr_diagnose ;;
             0) return ;;
             00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
             *) warn "无效选项"; sleep 1; continue ;;
