@@ -2,8 +2,9 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.5.9）
+#  从 VPS 开荒脚本独立提取（同步至 V3.6.1）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.6.1: 修复 initcwnd 在无网关默认路由环境下设置失败
 #  V3.5.9: 默认网卡检测改用 ip route get（多默认路由/策略路由更准）
 #  V3.5.8: 修复独立版缺失 4 个辅助函数(ensure_conntrack_module/svc_daemon_reload/
 #          svc_enable/svc_disable)，限速/场景预设/initcwnd 独立运行不再中断
@@ -986,7 +987,11 @@ bbr_menu_initcwnd() {
         *) warn "无效选项"; return ;;
     esac
 
-    ip route change default via "$GW" dev "$DEV" $ONLINK initcwnd "$VAL" initrwnd "$VAL" || {
+    if [ -n "$GW" ]; then
+        ip route change default via "$GW" dev "$DEV" $ONLINK initcwnd "$VAL" initrwnd "$VAL"
+    else
+        ip route change default dev "$DEV" $ONLINK initcwnd "$VAL" initrwnd "$VAL"
+    fi || {
         error "ip route change 失败"
         echo ""
         echo -e "  ${DIM}如果你在 LXC/OpenVZ 容器内，此操作会被宿主机拒绝，这是正常现象${NC}"
@@ -1000,7 +1005,7 @@ Description=Set TCP initcwnd
 After=network.target
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'GW=\$(ip route | awk '"'"'/^default/{print \$3}'"'"'); DEV=\$(ip route | awk '"'"'/^default/{print \$5}'"'"'); ONLINK=\$(ip route | grep "^default" | grep -q "onlink" && echo "onlink" || echo ""); ip route change default via \$GW dev \$DEV \$ONLINK initcwnd ${VAL} initrwnd ${VAL}'
+ExecStart=/bin/bash -c 'GW=\$(ip route | awk '"'"'/^default/{print \$3}'"'"'); DEV=\$(ip route | awk '"'"'/^default/{print \$5}'"'"'); ONLINK=\$(ip route | grep "^default" | grep -q "onlink" && echo "onlink" || echo ""); if [ -n "\$GW" ]; then ip route change default via "\$GW" dev "\$DEV" \$ONLINK initcwnd ${VAL} initrwnd ${VAL}; else ip route change default dev "\$DEV" \$ONLINK initcwnd ${VAL} initrwnd ${VAL}; fi'
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
