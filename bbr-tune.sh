@@ -2,8 +2,9 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.6.3）
+#  从 VPS 开荒脚本独立提取（同步至 V3.6.4）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.6.4: 服务管理统一使用 systemd_available 检测，减少 cron/容器环境误判
 #  V3.6.3: 新增脚本更新模块；新增 bbr 快捷键安装/刷新功能
 #  V3.6.2: BBR 模块增强：sysctl 权限探测无副作用、tc service 动态找 tc/网卡、
 #          不支持 sysctl 参数注释持久化、Alpine 内核包安装需确认、增加诊断入口
@@ -56,6 +57,10 @@ safe_clear() {
     fi
 }
 
+systemd_available() {
+    command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
 # ── 服务管理 / 内核模块辅助（独立运行所需，从主脚本同步）──
 ensure_conntrack_module() {
     lsmod 2>/dev/null | grep -q "^nf_conntrack" && return 0
@@ -68,7 +73,7 @@ svc_daemon_reload() {
 
 svc_enable() {
     local SVC="$1"
-    if command -v systemctl &>/dev/null && pidof systemd &>/dev/null; then
+    if systemd_available; then
         systemctl unmask "$SVC" 2>/dev/null || true
         systemctl enable "$SVC" --quiet 2>/dev/null || true
     elif command -v rc-update &>/dev/null; then

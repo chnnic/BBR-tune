@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.6.3 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.6.4 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -364,6 +364,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.6.4** | 服务管理统一使用 `systemd_available` 检测，减少 cron / 容器环境下的 systemd 误判 |
 | **同步 V3.6.3** | 新增脚本更新模块；新增 `bbr` 快捷键安装/刷新功能 |
 | **同步 V3.6.2** | BBR 模块增强：sysctl 权限探测不再改变 TCP 参数；tc 限速服务运行时动态识别 `tc` 路径和默认网卡；不支持的 sysctl 参数会在持久化文件中注释；Alpine 内核包安装改为确认后执行；新增 BBR 诊断入口 |
 | **同步 V3.6.1** | 修复 `initcwnd` 在无网关默认路由环境下设置失败 |
