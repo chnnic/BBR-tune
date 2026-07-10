@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.6.4 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.9.45 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -40,15 +40,14 @@ sudo ./bbr-tune.sh
   网卡 eth0  CC bbr  cwnd 10（默认）  限速 未设置
   缓冲 rmem 64MB  wmem 64MB  物理内存 2048MB
   ──────────────────────────────────────
-  1) 智能向导（推荐）
-  2) 自动配置（内存/延迟/带宽）
-  3) 手动选择缓冲区大小
+  1  智能向导（推荐）
+  2  自动配置               3  手动配置
   ──────────────────────────────────────
-  4) 限速设置（tc）   5) initcwnd 设置
-  6) 备份 TCP 配置    7) 还原 TCP 配置
-  8) BBR 诊断
-  9) 更新脚本        10) 设置 bbr 快捷键
-  0) 返回主菜单        00) 退出脚本
+  4  限速设置               5  initcwnd 设置
+  6  备份 TCP 配置          7  还原 TCP 配置
+  8  BBR 诊断
+  9  更新脚本              10  设置 bbr 快捷键
+  0  退出                  00  退出脚本
 ```
 
 ---
@@ -63,7 +62,7 @@ sudo ./bbr-tune.sh
 | `latency` 低延迟交互 | 32 MB | SSH / 游戏 / 远程桌面 |
 | `throughput` 高吞吐 | 64-512 MB | 大带宽 / 万兆 / 下载上传 |
 
-只写入 15 个核心 BBR 参数，不污染系统。
+只写入 BBR、缓冲区、连接质量和 UDP 相关参数，不修改 `/etc/sysctl.conf`。
 
 ### 场景化预设（代理架构专用）
 
@@ -110,7 +109,9 @@ sudo ./bbr-tune.sh
   7) 自动推荐    — 根据当前内存智能选择
 ```
 
-应用前自动提示备份旧配置，备份后再确认应用。
+确认后自动保存当前运行参数，再应用所选预设。
+
+自动推荐规则：小于 768MB 使用 `latency`，768MB-4GB 使用 `balanced`，4GB 及以上使用 `throughput`。
 
 ---
 
@@ -122,7 +123,7 @@ sudo ./bbr-tune.sh
 - **延迟：** 100ms 以内 / 100-200ms / 200ms 以上
 - **带宽：** 100M / 200M / 500M / 1G / 2G / 5G / 10G
 
-**BDP 估算：** `BDP = 带宽(MB/s) × 延迟(s) × 1.5`，结果超过物理内存一半自动降级。
+**BDP 估算：** `BDP(MB) = 带宽(Mbps) × RTT(ms) ÷ 8000`，缓冲目标按约 `1.5 × BDP` 向上取整，再匹配安全档位；结果超过物理内存一半自动降级。
 
 ---
 
@@ -169,7 +170,9 @@ sudo ./bbr-tune.sh
 
 **队列结构（保留 BBR pacing）：** 统一用 `htb` 做聚合整形（真正的硬上限）、叶子挂 `fq` 保留 BBR 的 pacing。旧版多队列网卡用 root `tbf` 会顶掉 `fq`、废掉 BBR pacing，反而伤害跨境高 BDP 吞吐；而单纯 `fq maxrate` 只能限「每流」、限不住聚合。`htb`(整形) + `fq`(pacing) 同时满足两者。
 
-**burst 随速率缩放：** `burst/cburst` 按速率自动缩放（约 8ms 量级，≈ RATE KB，下限 32KB），避免固定 burst 在高速率下令牌饥饿导致跑不满设定速率。持久化到 `/etc/systemd/system/tc-fq.service`（`After/Wants=network-online.target`，确保网卡就绪后再应用）。
+**burst 随速率缩放：** `burst/cburst` 按速率自动缩放（约 8ms 量级，≈ RATE KB，下限 32KB），避免固定 burst 在高速率下令牌饥饿导致跑不满设定速率。
+
+应用前会识别 root qdisc。仅允许替换系统默认的 `mq`、`fq`、`fq_codel`、`noqueue`、`pfifo_fast`，遇到 CAKE 等非本工具 QoS 会拒绝覆盖；取消限速也只删除带本工具状态标记的规则。支持 systemd、OpenRC 和 SysV 持久化。
 
 > **依赖：** 需内核 `sch_htb` + `sch_fq` 模块（主流发行版默认含）；缺失时自动报错并清理 root qdisc，不会留半套规则。
 > **OpenVZ：** 自动检测并提示，tc 通常被宿主机限制。
@@ -185,7 +188,7 @@ sudo ./bbr-tune.sh
 | 3 | 100 | 激进 |
 | 4 | 自定义 | 1-1000 |
 
-持久化到 `/etc/systemd/system/initcwnd.service`。
+支持 IPv4、IPv6 和 `default dev eth0` 这类无网关路由，保留默认路由的 `metric`、`src`、`proto` 等属性，并支持 systemd、OpenRC 和 SysV 持久化。
 
 > **LXC：** 自动检测，无独立网络命名空间权限时给出宿主机命令。
 
@@ -193,13 +196,13 @@ sudo ./bbr-tune.sh
 
 ### 6 / 7. 备份与还原
 
-应用新配置前自动备份带时间戳的旧配置，可一键还原或清除全部备份。
+首次调优会将运行参数保存为权限 `600` 的持久基线；每次应用前保存运行快照。BBR 核心参数失败或持久化文件写入失败时自动恢复本次修改前参数，场景切换时可恢复首次调优前基线，不再猜测内核默认值。
 
 ---
 
 ## 写入的 sysctl 参数
 
-### 通用预设（15 个核心参数）
+### 通用预设
 
 ```ini
 # ── 内存管理 ──
@@ -234,10 +237,11 @@ net.ipv4.udp_wmem_min = 16384
 
 ### 场景化预设额外参数
 
-**中转机 / 落地机 / 线路落地机 共有（8 项转发/并发参数）：**
+**中转机 / 落地机 / 线路落地机共有的转发/并发参数：**
 
 ```ini
 net.ipv4.ip_forward = 1
+net.ipv6.conf.<出口网卡>.accept_ra = 2       # forwarding 下继续接收 SLAAC RA
 net.ipv6.conf.all.forwarding = 1
 net.core.somaxconn = 8192
 net.core.netdev_max_backlog = 16384
@@ -268,9 +272,12 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 | 内核支持检测 | 应用前检测内核 ≥ 4.9、`tcp_bbr` 模块 |
 | sysctl 权限检测 | 自动识别无特权容器并拦截 |
 | 物理内存校验 | 缓冲区超过物理内存一半自动降级 |
-| 逐行应用 | `sysctl -w` 逐行写入，跳过内核不支持的参数 |
+| 事务应用 | BBR 核心参数失败时回滚运行参数，不覆盖旧持久化配置 |
+| 基线恢复 | 场景残留参数恢复首次调优前值，不写危险的猜测默认值 |
+| tc 所有权 | 不覆盖或删除 CAKE 等第三方 qdisc |
+| IPv6 RA | forwarding 场景设置出口网卡 `accept_ra=2`，避免 SLAAC 路由过期 |
 | conntrack 模块 | 场景预设前自动 modprobe |
-| 自动备份 | 应用前备份，可一键还原 |
+| 自动备份 | 每次应用保存运行快照，可一键还原 |
 
 ---
 
@@ -280,7 +287,8 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 |------|------|
 | Debian / Ubuntu / CentOS / Rocky | ✓ 完整 |
 | Alpine Linux | ✓ 需 `apk add bash`（非 bash 自动切换 / fail-fast 提示） |
-| OpenWrt | ✓ dumb 终端兼容 |
+| OpenWrt | △ sysctl 调优可用；tc/initcwnd 暂无 procd 持久化 |
+| 服务管理 | ✓ systemd / OpenRC / SysV |
 | LXC 容器 | ⚠ sysctl/initcwnd 受限，自动提示 |
 | OpenVZ 容器 | ⚠ tc 限速受限，自动提示 |
 | 无特权容器 | ⚠ sysctl 写入被拒，自动检测 |
@@ -316,8 +324,11 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 |------|------|
 | `/etc/sysctl.d/99-vps-bbr.conf` | sysctl 调优配置 |
 | `/etc/sysctl.d/99-vps-bbr.conf.bak.*` | 历史备份 |
+| `/var/lib/vps-tools/bbr-sysctl-baseline.conf` | 首次调优前 sysctl 运行基线（600） |
+| `/var/lib/vps-tools/tc-fq.state` | 本工具 tc 规则所有权和速率状态（600） |
 | `/etc/systemd/system/tc-fq.service` | tc 限速自启 |
 | `/etc/systemd/system/initcwnd.service` | initcwnd 自启 |
+| `/etc/init.d/tc-fq` / `initcwnd` | OpenRC / SysV 自启脚本 |
 
 ---
 
@@ -346,6 +357,22 @@ apk add linux-lts && reboot
 
 ---
 
+## 上游同步与验证
+
+BBR 核心逻辑由 `SSH-Hardening/src/modules/bbr.sh` 维护，本仓库只保留独立运行包装层。固定上游提交和模块哈希记录在 `UPSTREAM.env`。
+
+```bash
+scripts/sync-from-upstream.sh ../SSH-Hardening
+bash -n bbr-tune.sh
+shellcheck --severity=warning -x bbr-tune.sh scripts/sync-from-upstream.sh tests/smoke.sh
+scripts/sync-from-upstream.sh --check ../SSH-Hardening
+tests/smoke.sh
+```
+
+完整维护规则见 [SYNC_BBR.md](SYNC_BBR.md)。主仓 BBR 发生行为修改时，两个仓库应在同一批工作中分别提交并推送。
+
+---
+
 ## 开源地址
 
 ```
@@ -364,6 +391,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.9.45** | 修复场景恢复危险默认值、智能向导预检和失败误报；增加事务回滚、IPv6 RA 保护、tc 规则所有权、跨 init 持久化、IPv4/IPv6 无网关 initcwnd 路由解析，并修正 BDP 与 4GB 推荐逻辑 |
 | **同步 V3.6.4** | 服务管理统一使用 `systemd_available` 检测，减少 cron / 容器环境下的 systemd 误判 |
 | **同步 V3.6.3** | 新增脚本更新模块；新增 `bbr` 快捷键安装/刷新功能 |
 | **同步 V3.6.2** | BBR 模块增强：sysctl 权限探测不再改变 TCP 参数；tc 限速服务运行时动态识别 `tc` 路径和默认网卡；不支持的 sysctl 参数会在持久化文件中注释；Alpine 内核包安装改为确认后执行；新增 BBR 诊断入口 |

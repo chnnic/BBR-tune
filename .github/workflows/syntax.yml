@@ -10,7 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Check shell syntax
-        run: bash -n bbr-tune.sh
+        run: bash -n bbr-tune.sh scripts/sync-from-upstream.sh tests/smoke.sh
+
+      - name: Run ShellCheck
+        run: shellcheck --severity=warning -x bbr-tune.sh scripts/sync-from-upstream.sh tests/smoke.sh
+
+      - name: Verify upstream extraction
+        run: scripts/sync-from-upstream.sh --check
+
+      - name: Run smoke tests
+        run: tests/smoke.sh

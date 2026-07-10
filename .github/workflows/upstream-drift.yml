@@ -1,0 +1,29 @@
+name: Upstream BBR drift check
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  upstream-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout SSH-Hardening
+        uses: actions/checkout@v5
+        with:
+          repository: chnnic/SSH-Hardening
+          path: upstream
+
+      - name: Compare BBR module
+        run: |
+          expected=$(awk -F= '$1 == "UPSTREAM_MODULE_SHA256" { print $2 }' UPSTREAM.env)
+          actual=$(sha256sum upstream/src/modules/bbr.sh | awk '{print $1}')
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::SSH-Hardening BBR module changed. Run scripts/sync-from-upstream.sh and push BBR-tune."
+            exit 1
+          fi
+          echo "BBR-tune is synchronized with the upstream module."
