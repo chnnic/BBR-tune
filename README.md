@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.9.45 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.9.48 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -172,7 +172,7 @@ sudo ./bbr-tune.sh
 
 **burst 随速率缩放：** `burst/cburst` 按速率自动缩放（约 8ms 量级，≈ RATE KB，下限 32KB），避免固定 burst 在高速率下令牌饥饿导致跑不满设定速率。
 
-应用前会识别 root qdisc。仅允许替换系统默认的 `mq`、`fq`、`fq_codel`、`noqueue`、`pfifo_fast`，遇到 CAKE 等非本工具 QoS 会拒绝覆盖；取消限速也只删除带本工具状态标记的规则。支持 systemd、OpenRC 和 SysV 持久化。
+应用前会识别 root qdisc。仅允许替换系统默认的 `mq`、`fq`、`fq_codel`、`noqueue`、`pfifo_fast`，遇到 CAKE 等非本工具 QoS 会拒绝覆盖。升级前已存在的旧版 `htb 1:` + `fq 100:` 规则会通过完整 tc 拓扑和本工具持久化文件双重确认后自动迁移，修改或取消限速不再因缺少新版状态文件而失败。支持 systemd、OpenRC 和 SysV 持久化。
 
 > **依赖：** 需内核 `sch_htb` + `sch_fq` 模块（主流发行版默认含）；缺失时自动报错并清理 root qdisc，不会留半套规则。
 > **OpenVZ：** 自动检测并提示，tc 通常被宿主机限制。
@@ -391,6 +391,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.9.48** | 修复旧版生成的 `htb 1:` + `fq 100:` 限速因缺少状态文件被误判为外部 QoS；完整验证 tc 拓扑与本工具持久化标记后可安全修改或立即取消，第三方规则仍拒绝覆盖 |
 | **同步 V3.9.45** | 修复场景恢复危险默认值、智能向导预检和失败误报；增加事务回滚、IPv6 RA 保护、tc 规则所有权、跨 init 持久化、IPv4/IPv6 无网关 initcwnd 路由解析，并修正 BDP 与 4GB 推荐逻辑 |
 | **同步 V3.6.4** | 服务管理统一使用 `systemd_available` 检测，减少 cron / 容器环境下的 systemd 误判 |
 | **同步 V3.6.3** | 新增脚本更新模块；新增 `bbr` 快捷键安装/刷新功能 |

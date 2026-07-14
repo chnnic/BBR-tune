@@ -11,6 +11,7 @@ source "$ROOT/bbr-tune.sh"
 for fn in bbr_standalone_menu bbr_preflight bbr_runtime_snapshot bbr_ensure_baseline \
     bbr_restore_runtime_snapshot bbr_baseline_value bbr_apply_sysctl bbr_generate_config \
     bbr_bdp_mb bbr_buffer_target_mb bbr_recommend_profile bbr_tc_qdisc_safe_to_replace \
+    bbr_tc_topology_matches bbr_tc_managed_artifact bbr_tc_is_legacy_owned bbr_tc_apply_runtime \
     bbr_route_token bbr_route_strip_cwnd bbr_apply_initcwnd_route; do
     declare -F "$fn" >/dev/null || { echo "Missing function: $fn" >&2; exit 1; }
 done
@@ -41,6 +42,61 @@ EOF
 
 bbr_tc_qdisc_safe_to_replace fq || { echo "Safe default qdisc was rejected" >&2; exit 1; }
 ! bbr_tc_qdisc_safe_to_replace cake || { echo "Foreign CAKE qdisc would be overwritten" >&2; exit 1; }
+(
+    # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_is_owned
+    TC_STATE_FILE="$TMP/legacy-tc-no-state"
+    SERVICE_TC="$TMP/legacy-tc-fq.service"
+    # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_managed_artifact
+    SERVICE_TC_INIT="$TMP/legacy-tc-fq.init"
+    # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_managed_artifact/bbr_tc_restore_owned
+    TC_HELPER="$TMP/legacy-tc-helper"
+    TC_TEST_LOG="$TMP/legacy-tc.log"
+    export TC_TEST_LOG
+    cat > "$SERVICE_TC" <<'EOF'
+[Unit]
+Description=TC egress shaping 1024Mbps (htb shape + fq pacing for BBR)
+EOF
+    FAKE_TC="$TMP/fake-legacy-tc"
+    cat > "$FAKE_TC" <<'EOF'
+#!/bin/sh
+if [ "$1 $2" = "qdisc show" ]; then
+    cat <<'OUT'
+qdisc htb 1: root refcnt 3 r2q 10 default 0x10 direct_packets_stat 0 direct_qlen 1000
+qdisc fq 100: parent 1:10 limit 10000p flow_limit 100p buckets 1024 maxrate 1024Mbit
+OUT
+elif [ "$1 $2" = "class show" ]; then
+    echo 'class htb 1:10 root rate 1024Mbit ceil 1024Mbit burst 1024Kb cburst 1024Kb'
+else
+    printf '%s\n' "$*" >> "$TC_TEST_LOG"
+fi
+EOF
+    chmod +x "$FAKE_TC"
+    bbr_tc_is_legacy_owned eth0 "$FAKE_TC" || { echo "Legacy tc topology was not recognized" >&2; exit 1; }
+    bbr_tc_apply_runtime eth0 780 780 "$FAKE_TC" >/dev/null || { echo "Legacy tc topology could not be migrated" >&2; exit 1; }
+    grep -qx 'qdisc add dev eth0 parent 1:10 handle 100: fq maxrate 780mbit' "$TC_TEST_LOG" \
+        || { echo "Legacy tc migration did not apply the requested rate" >&2; exit 1; }
+    rm -f "$SERVICE_TC"
+    ! bbr_tc_is_legacy_owned eth0 "$FAKE_TC" || { echo "Legacy tc topology was claimed without a managed artifact" >&2; exit 1; }
+    cat > "$SERVICE_TC" <<'EOF'
+[Unit]
+Description=TC egress shaping 1024Mbps (htb shape + fq pacing for BBR)
+EOF
+    TC_BIN_DIR="$TMP/legacy-tc-bin"
+    mkdir -p "$TC_BIN_DIR"
+    cp "$FAKE_TC" "$TC_BIN_DIR/tc"
+    PATH="$TC_BIN_DIR:$PATH"
+    # shellcheck disable=SC2329 # test stubs consumed indirectly by bbr_remove_tc
+    default_iface() { echo eth0; }
+    # shellcheck disable=SC2329 # keep the removal test away from the host service manager
+    systemd_available() { return 1; }
+    # shellcheck disable=SC2329 # test stubs consumed through command -v
+    rc-update() { return 0; }
+    # shellcheck disable=SC2329 # test stub consumed indirectly by bbr_remove_tc
+    rc-service() { return 0; }
+    : > "$TC_TEST_LOG"
+    bbr_remove_tc >/dev/null || { echo "Legacy tc topology could not be removed" >&2; exit 1; }
+    grep -qx 'qdisc del dev eth0 root' "$TC_TEST_LOG" || { echo "Legacy tc removal left the root qdisc active" >&2; exit 1; }
+)
 [[ "$(bbr_route_token 'default dev eth0 proto static metric 100' dev)" = eth0 ]] || { echo "Direct route device parsing failed" >&2; exit 1; }
 [[ -z "$(bbr_route_token 'default dev eth0 proto static metric 100' via)" ]] || { echo "Direct route invented a gateway" >&2; exit 1; }
 [[ "$(bbr_route_strip_cwnd 'default via 192.0.2.1 dev eth0 initcwnd 50 initrwnd 50')" = 'default via 192.0.2.1 dev eth0' ]] || { echo "Route cwnd cleanup failed" >&2; exit 1; }
