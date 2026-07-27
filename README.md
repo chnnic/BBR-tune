@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.11.3 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.11.4 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -172,7 +172,7 @@ sudo ./bbr-tune.sh
 
 **burst 随速率缩放：** `burst/cburst` 按速率自动缩放（约 8ms 量级，≈ RATE KB，下限 32KB），避免固定 burst 在高速率下令牌饥饿导致跑不满设定速率。
 
-应用前会识别 root qdisc。系统默认的 `mq`、`fq`、`fq_codel`、`noqueue`、`pfifo_fast` 可直接替换；遇到外部 `tbf`、CAKE、HTB 等 QoS 时默认拒绝覆盖，并展示现有 qdisc/class/filter。只有输入精确确认词 `FORCE <网卡>` 后才会强制接管，删除前把文本与 JSON 诊断输出保存到 `/var/lib/vps-tools/tc-backups/`；该授权会写入持久化状态，重启后仍可接管外部 qdisc。升级前已存在的旧版 `htb 1:` + `fq 100:` 规则会通过完整 tc 拓扑和本工具持久化文件双重确认后自动迁移。支持 systemd、OpenRC 和 SysV 持久化。
+应用前会识别 root qdisc。系统默认的 `mq`、`fq`、`fq_codel`、`noqueue`、`pfifo_fast` 可直接替换，其中无法可靠删除的 `mq/noqueue` 使用 `tc qdisc replace` 原子安装 HTB。遇到外部 `tbf`、CAKE、HTB 等 QoS 时默认拒绝覆盖，并展示现有 qdisc/class/filter；输入 `FORCE <网卡>` 后才会强制接管。取消限速时外部规则会标注为“外部”，不会误报已删除；输入 `DELETE <网卡>` 后才会删除。接管或删除前会把文本与 JSON 诊断输出保存到 `/var/lib/vps-tools/tc-backups/`。支持 systemd、OpenRC 和 SysV 持久化。
 
 > **依赖：** 需内核 `sch_htb` + `sch_fq` 模块（主流发行版默认含）；缺失时自动报错并清理 root qdisc，不会留半套规则。
 > **OpenVZ：** 自动检测并提示，tc 通常被宿主机限制。
@@ -274,7 +274,7 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 | 物理内存校验 | 缓冲区超过物理内存一半自动降级 |
 | 事务应用 | BBR 核心参数失败时回滚运行参数，不覆盖旧持久化配置 |
 | 基线恢复 | 场景残留参数恢复首次调优前值，不写危险的猜测默认值 |
-| tc 所有权 | 默认不覆盖第三方 qdisc；仅在输入 `FORCE <网卡>` 后保存诊断快照并强制接管 |
+| tc 所有权 | 默认不覆盖或删除第三方 qdisc；接管需 `FORCE <网卡>`，删除需 `DELETE <网卡>`，操作前保存快照 |
 | IPv6 RA | forwarding 场景设置出口网卡 `accept_ra=2`，避免 SLAAC 路由过期 |
 | conntrack 模块 | 场景预设前自动 modprobe |
 | 自动备份 | 每次应用保存运行快照，可一键还原 |
@@ -326,7 +326,7 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 | `/etc/sysctl.d/99-vps-bbr.conf.bak.*` | 历史备份 |
 | `/var/lib/vps-tools/bbr-sysctl-baseline.conf` | 首次调优前 sysctl 运行基线（600） |
 | `/var/lib/vps-tools/tc-fq.state` | 本工具 tc 规则所有权和速率状态（600） |
-| `/var/lib/vps-tools/tc-backups/` | 强制接管外部 qdisc 前的文本与 JSON 诊断快照（目录 700、文件 600） |
+| `/var/lib/vps-tools/tc-backups/` | 接管或删除外部 qdisc 前的文本与 JSON 诊断快照（目录 700、文件 600） |
 | `/etc/systemd/system/tc-fq.service` | tc 限速自启 |
 | `/etc/systemd/system/initcwnd.service` | initcwnd 自启 |
 | `/etc/init.d/tc-fq` / `initcwnd` | OpenRC / SysV 自启脚本 |
@@ -392,6 +392,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.11.4** | 修复默认 `mq` 不能通过 `tc qdisc del` 删除导致限速应用及重启恢复失败，改用 `replace` 原子安装 HTB；外部限速会明确标注，输入 `DELETE <网卡>` 后可保存快照并删除 |
 | **同步 V3.11.3** | tc 限速支持显式强制接管外部 `tbf` / CAKE / HTB：默认拒绝覆盖并展示拓扑，输入 `FORCE <网卡>` 后保存诊断快照、替换 root qdisc，并持久化重启后的接管授权 |
 | **同步 V3.9.48** | 修复旧版生成的 `htb 1:` + `fq 100:` 限速因缺少状态文件被误判为外部 QoS；完整验证 tc 拓扑与本工具持久化标记后可安全修改或立即取消，第三方规则仍拒绝覆盖 |
 | **同步 V3.9.45** | 修复场景恢复危险默认值、智能向导预检和失败误报；增加事务回滚、IPv6 RA 保护、tc 规则所有权、跨 init 持久化、IPv4/IPv6 无网关 initcwnd 路由解析，并修正 BDP 与 4GB 推荐逻辑 |

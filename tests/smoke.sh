@@ -11,7 +11,8 @@ source "$ROOT/bbr-tune.sh"
 for fn in bbr_standalone_menu bbr_preflight bbr_runtime_snapshot bbr_ensure_baseline \
     bbr_restore_runtime_snapshot bbr_baseline_value bbr_apply_sysctl bbr_generate_config \
     bbr_bdp_mb bbr_buffer_target_mb bbr_recommend_profile bbr_tc_qdisc_safe_to_replace \
-    bbr_tc_snapshot_foreign bbr_tc_force_confirm bbr_tc_topology_matches bbr_tc_managed_artifact \
+    bbr_tc_current_rate bbr_tc_rate_display bbr_tc_snapshot_foreign bbr_tc_force_confirm bbr_tc_remove_confirm \
+    bbr_tc_topology_matches bbr_tc_managed_artifact \
     bbr_tc_is_legacy_owned bbr_tc_apply_runtime \
     bbr_route_token bbr_route_strip_cwnd bbr_apply_initcwnd_route; do
     declare -F "$fn" >/dev/null || { echo "Missing function: $fn" >&2; exit 1; }
@@ -43,6 +44,36 @@ EOF
 
 bbr_tc_qdisc_safe_to_replace fq || { echo "Safe default qdisc was rejected" >&2; exit 1; }
 ! bbr_tc_qdisc_safe_to_replace cake || { echo "Foreign CAKE qdisc would be overwritten" >&2; exit 1; }
+(
+    TC_STATE_FILE="$TMP/mq-no-state"
+    SERVICE_TC="$TMP/mq-tc.service"
+    # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_managed_artifact
+    SERVICE_TC_INIT="$TMP/mq-tc.init"
+    # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_managed_artifact/bbr_tc_restore_owned
+    TC_HELPER="$TMP/mq-tc-helper"
+    TC_TEST_LOG="$TMP/mq-tc.log"
+    export TC_TEST_LOG
+    FAKE_TC="$TMP/fake-mq-tc"
+    cat > "$FAKE_TC" <<'EOF'
+#!/bin/sh
+if [ "$1 $2" = "qdisc show" ]; then
+    printf '%s\n' 'qdisc mq 0: root' 'qdisc fq 0: parent :1 limit 10000p flow_limit 100p'
+    exit 0
+fi
+if [ "$1 $2" = "class show" ]; then exit 0; fi
+printf '%s\n' "$*" >> "$TC_TEST_LOG"
+[ "$1 $2" != "qdisc del" ]
+EOF
+    chmod +x "$FAKE_TC"
+    [ "$(bbr_tc_rate_display eth0 "$FAKE_TC")" = "未设置" ] \
+        || { echo "Default mq/fq topology reported a rate" >&2; exit 1; }
+    bbr_tc_apply_runtime eth0 2200 2200 "$FAKE_TC" >/dev/null \
+        || { echo "Undeletable mq root could not be replaced" >&2; exit 1; }
+    grep -qx 'qdisc replace dev eth0 root handle 1: htb default 10' "$TC_TEST_LOG" \
+        || { echo "mq root was not replaced atomically" >&2; exit 1; }
+    ! grep -qx 'qdisc del dev eth0 root' "$TC_TEST_LOG" \
+        || { echo "mq root was incorrectly deleted" >&2; exit 1; }
+)
 (
     # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_is_owned
     TC_STATE_FILE="$TMP/legacy-tc-no-state"
@@ -102,8 +133,21 @@ EOF
     # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_is_owned
     TC_STATE_FILE="$TMP/no-tc-state"
     TC_BACKUP_DIR="$TMP/tc-backups"
+    SERVICE_TC="$TMP/foreign-tc.service"
+    # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_managed_artifact/bbr_remove_tc
+    SERVICE_TC_INIT="$TMP/foreign-tc.init"
+    # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_managed_artifact/bbr_remove_tc
+    TC_HELPER="$TMP/foreign-tc-helper"
     TC_TEST_LOG="$TMP/foreign-tc.log"
     export TC_TEST_LOG
+    # shellcheck disable=SC2329 # test stub used indirectly by bbr_remove_tc
+    systemd_available() { return 1; }
+    # shellcheck disable=SC2329 # test stubs consumed through command -v by bbr_remove_tc
+    rc-update() { return 0; }
+    # shellcheck disable=SC2329 # test stub used indirectly by bbr_remove_tc
+    rc-service() { return 0; }
+    # shellcheck disable=SC2329 # test stub used indirectly by bbr_remove_tc
+    default_iface() { echo eth0; }
     FAKE_TC="$TMP/fake-foreign-tc"
     cat > "$FAKE_TC" <<'EOF'
 #!/bin/sh
@@ -116,11 +160,36 @@ if [ "$1 $2 $3" = "-j filter show" ]; then echo '[{"kind":"u32","parent":"8001:"
 printf '%s\n' "$*" >> "$TC_TEST_LOG"
 EOF
     chmod +x "$FAKE_TC"
+    TC_BIN_DIR="$TMP/foreign-tc-bin"
+    mkdir -p "$TC_BIN_DIR"
+    cp "$FAKE_TC" "$TC_BIN_DIR/tc"
+    PATH="$TC_BIN_DIR:$PATH"
 
+    [ "$(bbr_tc_rate_display eth0 "$FAKE_TC")" = "1024Mbit（外部 tbf）" ] \
+        || { echo "Foreign tbf rate was not labelled" >&2; exit 1; }
     APPLY_RC=0
     bbr_tc_apply_runtime eth0 500 500 "$FAKE_TC" >/dev/null 2>&1 || APPLY_RC=$?
     [ "$APPLY_RC" -eq 2 ] || { echo "Foreign tbf did not require force confirmation" >&2; exit 1; }
     [ ! -s "$TC_TEST_LOG" ] || { echo "Foreign tbf was modified without confirmation" >&2; exit 1; }
+    REMOVE_RC=0
+    bbr_remove_tc >/dev/null 2>&1 || REMOVE_RC=$?
+    [ "$REMOVE_RC" -eq 2 ] || { echo "Cancel did not identify the foreign tbf" >&2; exit 1; }
+    [ ! -s "$TC_TEST_LOG" ] || { echo "Cancel deleted foreign tbf without confirmation" >&2; exit 1; }
+    if bbr_tc_remove_confirm eth0 "$FAKE_TC" >/dev/null 2>&1 <<'EOF'
+DELETE eth1
+EOF
+    then
+        echo "Incorrect deletion confirmation was accepted" >&2
+        exit 1
+    fi
+    bbr_tc_remove_confirm eth0 "$FAKE_TC" >/dev/null <<'EOF'
+DELETE eth0
+EOF
+    bbr_remove_tc 1 >/dev/null || { echo "Confirmed foreign tbf deletion failed" >&2; exit 1; }
+    grep -qx 'qdisc del dev eth0 root' "$TC_TEST_LOG" \
+        || { echo "Confirmed foreign tbf was not deleted" >&2; exit 1; }
+    : > "$TC_TEST_LOG"
+    rm -rf "$TC_BACKUP_DIR"
     if bbr_tc_force_confirm eth0 500 "$FAKE_TC" >/dev/null 2>&1 <<'EOF'
 FORCE eth1
 EOF
@@ -158,5 +227,29 @@ awk 'p && /^TC_HELPER_EOF$/{exit} /<< '\''TC_HELPER_EOF'\''/{p=1; next} p{print}
 awk 'p && /^CWND_HELPER_EOF$/{exit} /<< '\''CWND_HELPER_EOF'\''/{p=1; next} p{print}' "$MODULE" > "$CWND_HELPER"
 sh -n "$TC_HELPER"
 sh -n "$CWND_HELPER"
+
+(
+    HELPER_STATE="$TMP/tc-helper-mq.state"
+    HELPER_RUN="$TMP/tc-helper-mq.sh"
+    HELPER_BIN="$TMP/tc-helper-bin"
+    HELPER_LOG="$TMP/tc-helper-mq.log"
+    export HELPER_LOG
+    sed "s|^STATE=.*|STATE=$HELPER_STATE|" "$TC_HELPER" > "$HELPER_RUN"
+    chmod +x "$HELPER_RUN"
+    printf 'DEV=eth0\nRATE=2200\nBURST_KB=2200\nFORCE=0\n' > "$HELPER_STATE"
+    mkdir -p "$HELPER_BIN"
+    cat > "$HELPER_BIN/tc" <<'EOF'
+#!/bin/sh
+if [ "$1 $2" = "qdisc show" ]; then echo 'qdisc mq 0: root'; exit 0; fi
+if [ "$1 $2" = "class show" ]; then exit 0; fi
+printf '%s\n' "$*" >> "$HELPER_LOG"
+[ "$1 $2" != "qdisc del" ]
+EOF
+    chmod +x "$HELPER_BIN/tc"
+    PATH="$HELPER_BIN:$PATH" "$HELPER_RUN" apply \
+        || { echo "Generated helper could not replace mq after reboot" >&2; exit 1; }
+    grep -qx 'qdisc replace dev eth0 root handle 1: htb default 10' "$HELPER_LOG" \
+        || { echo "Generated helper did not replace mq after reboot" >&2; exit 1; }
+)
 
 echo "BBR-tune smoke test passed."
