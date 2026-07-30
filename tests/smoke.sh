@@ -12,9 +12,10 @@ for fn in bbr_standalone_menu bbr_preflight bbr_runtime_snapshot bbr_ensure_base
     bbr_restore_runtime_snapshot bbr_baseline_value bbr_apply_sysctl bbr_generate_config \
     bbr_physical_memory_mb bbr_effective_memory_mb bbr_buffer_cap_bytes bbr_conntrack_max_for_memory \
     bbr_bdp_mb bbr_buffer_target_mb bbr_recommend_profile bbr_tc_qdisc_safe_to_replace \
-    bbr_tc_current_rate bbr_tc_rate_display bbr_tc_snapshot_foreign bbr_tc_force_confirm bbr_tc_remove_confirm \
+    bbr_tc_current_rate bbr_tc_saved_values bbr_tc_saved_rate_display bbr_tc_rate_display \
+    bbr_tc_snapshot_foreign bbr_tc_force_confirm bbr_tc_remove_confirm \
     bbr_tc_topology_matches bbr_tc_managed_artifact \
-    bbr_tc_is_legacy_owned bbr_tc_apply_runtime \
+    bbr_tc_is_legacy_owned bbr_tc_persistence_current bbr_tc_reconcile_saved bbr_tc_apply_runtime \
     bbr_route_token bbr_route_strip_cwnd bbr_apply_initcwnd_route; do
     declare -F "$fn" >/dev/null || { echo "Missing function: $fn" >&2; exit 1; }
 done
@@ -100,6 +101,46 @@ EOF
         || { echo "mq root was not replaced atomically" >&2; exit 1; }
     ! grep -qx 'qdisc del dev eth0 root' "$TC_TEST_LOG" \
         || { echo "mq root was incorrectly deleted" >&2; exit 1; }
+)
+(
+    TC_STATE_FILE="$TMP/saved-tc.state"
+    TC_HELPER="$TMP/saved-tc-helper"
+    SERVICE_TC="$TMP/saved-tc.service"
+    SERVICE_TC_INIT="$TMP/saved-tc.init"
+    TC_MARKER="$TMP/saved-tc-active"
+    export TC_MARKER
+    printf 'DEV=eth0\nRATE=2200\nBURST_KB=2200\nFORCE=0\n' > "$TC_STATE_FILE"
+    TC_BIN_DIR="$TMP/saved-tc-bin"
+    mkdir -p "$TC_BIN_DIR"
+    cat > "$TC_BIN_DIR/tc" <<'EOF'
+#!/bin/sh
+if [ "$1 $2" = "qdisc show" ]; then
+    if [ -f "$TC_MARKER" ]; then
+        printf '%s\n' 'qdisc htb 1: root default 0x10' 'qdisc fq 100: parent 1:10 maxrate 2200Mbit'
+    else
+        echo 'qdisc mq 0: root'
+    fi
+elif [ "$1 $2" = "class show" ] && [ -f "$TC_MARKER" ]; then
+    echo 'class htb 1:10 root rate 2200Mbit ceil 2200Mbit'
+fi
+EOF
+    chmod +x "$TC_BIN_DIR/tc"
+    cat > "$TC_HELPER" <<'EOF'
+#!/bin/sh
+# VPS_TOOLS_TC_HELPER_VERSION=2
+[ "${1:-}" = apply ] || exit 1
+: > "$TC_MARKER"
+EOF
+    chmod +x "$TC_HELPER"
+    PATH="$TC_BIN_DIR:$PATH"
+    default_iface() { echo eth0; }
+    [ "$(bbr_tc_rate_display eth0 "$TC_BIN_DIR/tc")" = "2200Mbit（已保存，未生效）" ] \
+        || { echo "Inactive saved tc rate was not displayed" >&2; exit 1; }
+    unset BBR_TUNE_TEST_MODE VPS_TOOLS_TEST_MODE
+    bbr_tc_reconcile_saved >/dev/null || { echo "Saved tc rate was not restored" >&2; exit 1; }
+    [ -f "$TC_MARKER" ] || { echo "Saved tc helper was not invoked" >&2; exit 1; }
+    [ "$(bbr_tc_rate_display eth0 "$TC_BIN_DIR/tc")" = "2200Mbit" ] \
+        || { echo "Restored tc rate remained inactive" >&2; exit 1; }
 )
 (
     # shellcheck disable=SC2034 # consumed indirectly by bbr_tc_is_owned
@@ -254,6 +295,10 @@ awk 'p && /^TC_HELPER_EOF$/{exit} /<< '\''TC_HELPER_EOF'\''/{p=1; next} p{print}
 awk 'p && /^CWND_HELPER_EOF$/{exit} /<< '\''CWND_HELPER_EOF'\''/{p=1; next} p{print}' "$MODULE" > "$CWND_HELPER"
 sh -n "$TC_HELPER"
 sh -n "$CWND_HELPER"
+grep -qxF '# VPS_TOOLS_TC_HELPER_VERSION=2' "$TC_HELPER" \
+    || { echo "Generated tc helper is missing its compatibility version" >&2; exit 1; }
+grep -q -- '--bbr-reconcile-tc)' "$ROOT/bbr-tune.sh" \
+    || { echo "Standalone tc reconciliation CLI dispatch is missing" >&2; exit 1; }
 
 (
     HELPER_STATE="$TMP/tc-helper-mq.state"

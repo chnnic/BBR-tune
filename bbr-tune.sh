@@ -2,8 +2,9 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.11.5）
+#  从 VPS 开荒脚本独立提取（同步至 V3.11.6）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.11.6: tc 运行规则丢失时识别保存状态并自动恢复
 #  V3.11.5: 收紧内存策略，移除激进全局参数，内核转发改为按需启用
 #  V3.11.4: 修复 mq 网卡无法限速，并支持确认后删除外部限速
 #  V3.11.3: tc 限速支持显式确认后强制接管外部 root qdisc
@@ -246,6 +247,10 @@ bbr_self_update() {
 
     chmod 755 "$TMP"
     mv "$TMP" "$TARGET" || { rm -f "$TMP"; error "更新 ${TARGET} 失败"; return 1; }
+    if [ -s "${TC_STATE_FILE:-/var/lib/vps-tools/tc-fq.state}" ]; then
+        BBR_TUNE_TEST_MODE=0 bash "$TARGET" --bbr-reconcile-tc \
+            || warn "已保存的 tc 限速状态未能自动恢复，请重新进入脚本检查"
+    fi
     info "脚本已更新：${TARGET}"
     [ "$TARGET" = "$INSTALL_PATH" ] && info "快捷键可用：bbr"
 }
@@ -734,6 +739,7 @@ bbr_apply_sysctl() {
     if [ "$SKIPPED" -gt 0 ]; then
         warn "共跳过 ${SKIPPED} 个不支持的参数（已在配置文件中注释，重启后不报错）"
     fi
+    [ ! -s "$TC_STATE_FILE" ] || bbr_tc_reconcile_saved || true
     info "sysctl 配置已应用到 ${SYSCTL_FILE} ✓"
     return 0
 }
@@ -772,10 +778,41 @@ bbr_tc_current_rate() {
     printf '%s\n' "$RATE"
 }
 
+bbr_tc_saved_values() {
+    local DEV RATE BURST_KB FORCE
+    DEV=$(bbr_state_value "$TC_STATE_FILE" DEV 2>/dev/null || true)
+    RATE=$(bbr_state_value "$TC_STATE_FILE" RATE 2>/dev/null || true)
+    BURST_KB=$(bbr_state_value "$TC_STATE_FILE" BURST_KB 2>/dev/null || true)
+    FORCE=$(bbr_state_value "$TC_STATE_FILE" FORCE 2>/dev/null || true)
+    echo "$DEV" | grep -qE '^[[:alnum:]_.-]{1,15}$' || return 1
+    echo "$RATE" | grep -qE '^[0-9]+$' || return 1
+    echo "$BURST_KB" | grep -qE '^[0-9]+$' || return 1
+    [ "$RATE" -gt 0 ] && [ "$BURST_KB" -gt 0 ] || return 1
+    case "$FORCE" in 0|1) : ;; *) FORCE=0 ;; esac
+    printf '%s %s %s %s\n' "$DEV" "$RATE" "$BURST_KB" "$FORCE"
+}
+
+bbr_tc_saved_rate_display() {
+    local CURRENT_DEV="$1" SAVED_VALUES SAVED_DEV SAVED_RATE
+    SAVED_VALUES=$(bbr_tc_saved_values) || return 1
+    SAVED_DEV=${SAVED_VALUES%% *}
+    SAVED_RATE=${SAVED_VALUES#* }
+    SAVED_RATE=${SAVED_RATE%% *}
+    if [ "$SAVED_DEV" = "$CURRENT_DEV" ]; then
+        printf '%sMbit（已保存，未生效）\n' "$SAVED_RATE"
+    else
+        printf '%sMbit（保存于 %s，当前未生效）\n' "$SAVED_RATE" "$SAVED_DEV"
+    fi
+}
+
 bbr_tc_rate_display() {
-    local DEV="$1" TC_BIN="$2" RATE QDISCS LINE TYPE
+    local DEV="$1" TC_BIN="$2" RATE QDISCS LINE TYPE SAVED_RATE
     RATE=$(bbr_tc_current_rate "$DEV" "$TC_BIN")
-    [ -n "$RATE" ] || { echo "未设置"; return; }
+    if [ -z "$RATE" ]; then
+        SAVED_RATE=$(bbr_tc_saved_rate_display "$DEV" 2>/dev/null || true)
+        [ -z "$SAVED_RATE" ] && echo "未设置" || echo "$SAVED_RATE"
+        return
+    fi
     QDISCS=$("$TC_BIN" qdisc show dev "$DEV" 2>/dev/null || true)
     LINE=$(bbr_tc_root_line "$QDISCS")
     TYPE=$(bbr_tc_qdisc_type "$LINE")
@@ -929,6 +966,59 @@ bbr_tc_restore_owned() {
     return 1
 }
 
+bbr_tc_persistence_current() {
+    [ -x "$TC_HELPER" ] \
+        && grep -qxF '# VPS_TOOLS_TC_HELPER_VERSION=2' "$TC_HELPER" 2>/dev/null
+}
+
+bbr_tc_reconcile_saved() {
+    local CURRENT_DEV SAVED_VALUES SAVED_REST SAVED_DEV SAVED_RATE SAVED_BURST SAVED_FORCE TC_BIN
+    [ "${VPS_TOOLS_TEST_MODE:-0}" != 1 ] || return 2
+    [ "${BBR_TUNE_TEST_MODE:-0}" != 1 ] || return 2
+    SAVED_VALUES=$(bbr_tc_saved_values) || return 2
+    SAVED_DEV=${SAVED_VALUES%% *}
+    SAVED_REST=${SAVED_VALUES#* }
+    SAVED_RATE=${SAVED_REST%% *}
+    SAVED_REST=${SAVED_REST#* }
+    SAVED_BURST=${SAVED_REST%% *}
+    SAVED_FORCE=${SAVED_REST##* }
+    CURRENT_DEV=$(default_iface)
+    if [ "$SAVED_DEV" != "$CURRENT_DEV" ]; then
+        warn "已保存 ${SAVED_DEV} 的 ${SAVED_RATE}Mbps 限速，但当前默认网卡为 ${CURRENT_DEV:-未知}，未自动迁移"
+        return 1
+    fi
+    TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
+    [ -x "$TC_BIN" ] || { warn "已保存 ${SAVED_RATE}Mbps 限速，但 tc 命令不可用"; return 1; }
+    if bbr_tc_is_owned "$SAVED_DEV" "$TC_BIN"; then
+        bbr_tc_persistence_current && return 0
+        if bbr_tc_write_persistence "$SAVED_DEV" "$SAVED_RATE" "$SAVED_BURST" "$SAVED_FORCE" \
+            && bbr_tc_is_owned "$SAVED_DEV" "$TC_BIN"; then
+            info "检测到旧版 tc 持久化配置，已自动升级 ✓"
+            return 0
+        fi
+        warn "tc 限速当前有效，但持久化配置升级失败"
+        return 1
+    fi
+    if bbr_tc_persistence_current \
+        && bbr_tc_restore_owned \
+        && bbr_tc_is_owned "$SAVED_DEV" "$TC_BIN"; then
+        info "检测到已保存的 ${SAVED_RATE}Mbps 限速未生效，已自动恢复 ✓"
+        return 0
+    fi
+    if bbr_tc_apply_runtime "$SAVED_DEV" "$SAVED_RATE" "$SAVED_BURST" "$TC_BIN" "$SAVED_FORCE"; then
+        if bbr_tc_write_persistence "$SAVED_DEV" "$SAVED_RATE" "$SAVED_BURST" "$SAVED_FORCE" \
+            && bbr_tc_is_owned "$SAVED_DEV" "$TC_BIN"; then
+            info "检测到已保存的 ${SAVED_RATE}Mbps 限速未生效，已自动恢复并升级持久化配置 ✓"
+            return 0
+        fi
+        warn "tc 限速已恢复运行，但持久化配置更新失败"
+        return 1
+    fi
+    warn "已保存 ${SAVED_RATE}Mbps 限速，但自动恢复失败"
+    echo -e "  ${DIM}可检查：${TC_HELPER} apply && tc -s qdisc show dev ${SAVED_DEV}${NC}"
+    return 1
+}
+
 bbr_tc_apply_runtime() {
     local DEV="$1" RATE="$2" BURST_KB="$3" TC_BIN="$4" FORCE="${5:-0}"
     local QDISCS LINE TYPE WAS_OWNED=0 FORCED_FOREIGN=0 SNAPSHOT="" ROOT_ACTION=add
@@ -1011,6 +1101,7 @@ bbr_tc_write_persistence() {
     TMP=$(mktemp "${TC_HELPER}.tmp.XXXXXX") || return 1
     cat > "$TMP" << 'TC_HELPER_EOF'
 #!/bin/sh
+# VPS_TOOLS_TC_HELPER_VERSION=2
 STATE=/var/lib/vps-tools/tc-fq.state
 state_value() { awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$STATE"; }
 DEV=$(state_value DEV)
@@ -2271,6 +2362,7 @@ bbr_menu() {
     if ! ensure_sysctl || ! has_sysctl_write; then
         _BBR_NO_SYSCTL=1
     fi
+    [ ! -s "$TC_STATE_FILE" ] || bbr_tc_reconcile_saved || true
     while true; do
         print_header "BBR TCP 调优"
         bbr_print_status
@@ -2317,6 +2409,7 @@ bbr_menu() {
 
 bbr_standalone_menu() {
     local CH
+    [ ! -s "$TC_STATE_FILE" ] || bbr_tc_reconcile_saved || true
     while true; do
         print_header "BBR TCP 调优"
         bbr_print_status
@@ -2354,5 +2447,11 @@ bbr_standalone_menu() {
 }
 
 if [ "${BBR_TUNE_TEST_MODE:-0}" != 1 ]; then
-    bbr_standalone_menu
+    case "${1:-}" in
+        --bbr-reconcile-tc)
+            bbr_tc_reconcile_saved
+            exit $?
+            ;;
+        *) bbr_standalone_menu ;;
+    esac
 fi

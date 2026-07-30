@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.11.5 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.11.6 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -174,6 +174,8 @@ sudo ./bbr-tune.sh
 **burst 随速率缩放：** `burst/cburst` 按速率自动缩放（约 8ms 量级，≈ RATE KB，下限 32KB），避免固定 burst 在高速率下令牌饥饿导致跑不满设定速率。
 
 应用前会识别 root qdisc。系统默认的 `mq`、`fq`、`fq_codel`、`noqueue`、`pfifo_fast` 可直接替换，其中无法可靠删除的 `mq/noqueue` 使用 `tc qdisc replace` 原子安装 HTB。遇到外部 `tbf`、CAKE、HTB 等 QoS 时默认拒绝覆盖，并展示现有 qdisc/class/filter；输入 `FORCE <网卡>` 后才会强制接管。取消限速时外部规则会标注为“外部”，不会误报已删除；输入 `DELETE <网卡>` 后才会删除。接管或删除前会把文本与 JSON 诊断输出保存到 `/var/lib/vps-tools/tc-backups/`。支持 systemd、OpenRC 和 SysV 持久化。
+
+限速状态保存在 `/var/lib/vps-tools/tc-fq.state`。网卡重建导致运行规则回到 `mq/fq` 时，更新脚本、应用 BBR 配置或重新进入工具会自动恢复，并刷新旧版持久化助手。界面会区分“未设置”和“已保存、未生效”；默认网卡名称变化时只提示人工确认，不会把旧配置静默迁移到新网卡。
 
 > **依赖：** 需内核 `sch_htb` + `sch_fq` 模块（主流发行版默认含）；缺失时自动报错并清理 root qdisc，不会留半套规则。
 > **OpenVZ：** 自动检测并提示，tc 通常被宿主机限制。
@@ -393,6 +395,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.11.6** | 修复更新或网卡重建后 tc 运行规则丢失却显示“未设置”：识别已保存但未生效的状态，更新完成、应用 BBR 配置及启动工具时自动恢复并升级旧版持久化助手；默认网卡变化时拒绝静默迁移 |
 | **同步 V3.11.5** | 自动/智能配置按实际物理内存计算并将缓冲上限收紧至 25%，TCP 每连接默认缓冲恢复保守值；停止覆盖 `tcp_mem`、`min_free_kbytes` 及过时/高风险全局参数；场景转发改为按需确认，IPv6 RA 覆盖默认与当前出口，conntrack 按内存分档，并对 BBR 与 `fq` 执行写后回读和失败回滚 |
 | **同步 V3.11.4** | 修复默认 `mq` 不能通过 `tc qdisc del` 删除导致限速应用及重启恢复失败，改用 `replace` 原子安装 HTB；外部限速会明确标注，输入 `DELETE <网卡>` 后可保存快照并删除 |
 | **同步 V3.11.3** | tc 限速支持显式强制接管外部 `tbf` / CAKE / HTB：默认拒绝覆盖并展示拓扑，输入 `FORCE <网卡>` 后保存诊断快照、替换 root qdisc，并持久化重启后的接管授权 |
