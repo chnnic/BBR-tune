@@ -2,8 +2,9 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.11.4）
+#  从 VPS 开荒脚本独立提取（同步至 V3.11.5）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
+#  V3.11.5: 收紧内存策略，移除激进全局参数，内核转发改为按需启用
 #  V3.11.4: 修复 mq 网卡无法限速，并支持确认后删除外部限速
 #  V3.11.3: tc 限速支持显式确认后强制接管外部 root qdisc
 #  V3.9.48: 修复旧版 tc 限速缺少状态文件时无法修改或立即取消
@@ -302,31 +303,36 @@ bbr_scene_keys() {
         net.netfilter.nf_conntrack_tcp_timeout_time_wait \
         net.ipv4.ip_local_port_range \
         net.ipv4.tcp_max_tw_buckets \
+        net.ipv6.conf.default.accept_ra \
         fs.file-max
     [ -n "$IPV6_IFACE" ] && printf 'net.ipv6.conf.%s.accept_ra\n' "$IPV6_IFACE"
+}
+
+bbr_retired_keys() {
+    printf '%s\n' \
+        vm.min_free_kbytes \
+        net.ipv4.tcp_mem \
+        net.ipv4.tcp_adv_win_scale \
+        net.ipv4.tcp_fastopen_blackhole_timeout_sec \
+        net.ipv4.tcp_ecn \
+        net.ipv4.tcp_slow_start_after_idle \
+        net.ipv4.tcp_tw_reuse \
+        net.ipv4.tcp_fin_timeout \
+        net.ipv4.tcp_keepalive_time
 }
 
 bbr_managed_keys() {
     printf '%s\n' \
         vm.swappiness \
-        vm.min_free_kbytes \
         net.core.default_qdisc \
         net.ipv4.tcp_congestion_control \
         net.core.rmem_max \
         net.core.wmem_max \
         net.ipv4.tcp_rmem \
         net.ipv4.tcp_wmem \
-        net.ipv4.tcp_mem \
-        net.ipv4.tcp_adv_win_scale \
         net.ipv4.tcp_notsent_lowat \
         net.ipv4.tcp_fastopen \
-        net.ipv4.tcp_fastopen_blackhole_timeout_sec \
         net.ipv4.tcp_mtu_probing \
-        net.ipv4.tcp_ecn \
-        net.ipv4.tcp_slow_start_after_idle \
-        net.ipv4.tcp_tw_reuse \
-        net.ipv4.tcp_fin_timeout \
-        net.ipv4.tcp_keepalive_time \
         net.ipv4.udp_rmem_min \
         net.ipv4.udp_wmem_min
     bbr_scene_keys
@@ -438,6 +444,24 @@ bbr_config_has_key() {
     '
 }
 
+bbr_config_value() {
+    local CONFIG="$1" KEY="$2"
+    printf '%s\n' "$CONFIG" | awk -F= -v key="$KEY" '
+        {
+            lhs=$1
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", lhs)
+        }
+        lhs == key {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            gsub(/[[:space:]]+$/, "")
+            print
+            found=1
+            exit
+        }
+        END { if (!found) exit 1 }
+    '
+}
+
 bbr_config_keys() {
     printf '%s\n' "$1" | awk -F= '
         {
@@ -480,25 +504,26 @@ bbr_print_status() {
     TCP_WMEM_MB=$(( ${TCP_WMEM_MAX:-0} / 1048576 ))
 
     echo -e "  ${CYAN}网卡${NC} ${BOLD}$DEV${NC}  ${CYAN}CC${NC} ${BOLD}$BBR${NC}  ${CYAN}cwnd${NC} ${BOLD}$CWND${NC}  ${CYAN}限速${NC} ${BOLD}$RATE${NC}"
-    # 检测缓冲区是否超过物理内存一半（显示警告）
+    # 检测缓冲区是否超过物理内存四分之一（显示警告）
     local MEM_TOTAL_MB
-    MEM_TOTAL_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
+    MEM_TOTAL_MB=$(bbr_physical_memory_mb)
     local RMEM_COLOR WMEM_COLOR
     RMEM_COLOR="$BOLD"
     WMEM_COLOR="$BOLD"
     if [ "${MEM_TOTAL_MB:-0}" -gt 0 ]; then
-        [ "$RMEM_MB" -gt $(( MEM_TOTAL_MB / 2 )) ] && RMEM_COLOR="${YELLOW}${BOLD}"
-        [ "$WMEM_MB" -gt $(( MEM_TOTAL_MB / 2 )) ] && WMEM_COLOR="${YELLOW}${BOLD}"
+        [ "$RMEM_MB" -gt $(( MEM_TOTAL_MB / 4 )) ] && RMEM_COLOR="${YELLOW}${BOLD}"
+        [ "$WMEM_MB" -gt $(( MEM_TOTAL_MB / 4 )) ] && WMEM_COLOR="${YELLOW}${BOLD}"
     fi
     echo -e "  ${CYAN}缓冲${NC} rmem ${RMEM_COLOR}${RMEM_MB}MB${NC}  wmem ${WMEM_COLOR}${WMEM_MB}MB${NC}  tcp_r ${BOLD}${TCP_RMEM_MB}MB${NC}  tcp_w ${BOLD}${TCP_WMEM_MB}MB${NC}  ${DIM}物理内存 ${MEM_TOTAL_MB}MB${NC}"
 }
 
 # ── 备份 sysctl ───────────────────────────────────────────
 bbr_backup_sysctl() {
-    local BAK
+    local BAK CURRENT_CONFIG=""
     BAK="${SYSCTL_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
     [ -e "$BAK" ] && BAK="${BAK}.$$"
-    if bbr_runtime_snapshot "$BAK"; then
+    [ ! -f "$SYSCTL_FILE" ] || CURRENT_CONFIG=$(cat "$SYSCTL_FILE")
+    if bbr_runtime_snapshot "$BAK" "$CURRENT_CONFIG"; then
         info "已备份当前运行参数至：$BAK"
     else
         error "BBR 运行参数备份失败"
@@ -584,6 +609,25 @@ bbr_apply_sysctl() {
         return 1
     fi
 
+    # 新版本不再管理这些高风险或已废弃参数；升级时立即恢复首次基线。
+    if [ -f "$SYSCTL_FILE" ]; then
+        local RETIRED_STALE="" RETIRED_FAILED=0 k
+        for k in $(bbr_retired_keys); do
+            if bbr_config_has_key "$(cat "$SYSCTL_FILE")" "$k" && ! bbr_config_has_key "$CONFIG" "$k"; then
+                RETIRED_STALE="$RETIRED_STALE $k"
+            fi
+        done
+        if [ -n "$RETIRED_STALE" ]; then
+            info "正在恢复旧版激进参数到首次调优前基线"
+            for k in $RETIRED_STALE; do
+                bbr_restore_baseline_key "$k" || RETIRED_FAILED=1
+            done
+            if [ "$RETIRED_FAILED" -ne 0 ]; then
+                warn "部分旧参数缺少基线，当前值将保留到重启；新配置不会再持久化这些参数"
+            fi
+        fi
+    fi
+
     # ── 切换预设时复位「旧配置写过、但新配置不再包含」的场景专有键 ──
     # 否则从中转/落地降级回普通预设后，ip_forward / conntrack 等会一直残留在内核里。
     # 仅复位本脚本场景预设管理的键，且新配置确实不含该键时才动；ip_forward 谨慎处理。
@@ -648,15 +692,34 @@ bbr_apply_sysctl() {
             warn "跳过不支持的参数：${KEY}"
             echo "# skipped unsupported: $line" >> "$TMP_FILE"
             SKIPPED=$(( SKIPPED + 1 ))
-            [ "$KEY" = "net.ipv4.tcp_congestion_control" ] && CORE_FAILED=1
+            case "$KEY" in
+                net.core.default_qdisc|net.ipv4.tcp_congestion_control) CORE_FAILED=1 ;;
+            esac
         fi
     done <<< "$CONFIG"
+
+    if [ "$CORE_FAILED" -eq 0 ]; then
+        local EXPECTED_CC EXPECTED_QDISC ACTIVE_CC ACTIVE_QDISC
+        EXPECTED_CC=$(bbr_config_value "$CONFIG" net.ipv4.tcp_congestion_control 2>/dev/null || true)
+        EXPECTED_QDISC=$(bbr_config_value "$CONFIG" net.core.default_qdisc 2>/dev/null || true)
+        if [ -n "$EXPECTED_CC" ]; then
+            ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+            [ "$ACTIVE_CC" = "$EXPECTED_CC" ] || CORE_FAILED=1
+        fi
+        if [ -n "$EXPECTED_QDISC" ]; then
+            ACTIVE_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+            [ "$ACTIVE_QDISC" = "$EXPECTED_QDISC" ] || CORE_FAILED=1
+        fi
+        if [ "$CORE_FAILED" -ne 0 ]; then
+            error "BBR 核心参数写入后回读不一致：cc=${ACTIVE_CC:-未校验}/${EXPECTED_CC:-未设置} qdisc=${ACTIVE_QDISC:-未校验}/${EXPECTED_QDISC:-未设置}"
+        fi
+    fi
 
     if [ "$CORE_FAILED" -eq 1 ]; then
         rm -f "$TMP_FILE"
         bbr_restore_runtime_snapshot "$TX_SNAPSHOT" || warn "部分运行参数自动回滚失败"
         rm -f "$TX_SNAPSHOT"
-        error "BBR 拥塞算法未能启用，已回滚本次参数修改"
+        error "BBR 核心参数未能完整启用，已回滚本次参数修改"
         return 1
     fi
     if ! mv "$TMP_FILE" "$SYSCTL_FILE"; then
@@ -1143,15 +1206,55 @@ bbr_remove_tc() {
 }
 
 # ── 生成 sysctl 配置内容 ──────────────────────────────────
+bbr_physical_memory_mb() {
+    local MEM_KB
+    MEM_KB=$(awk '/MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null)
+    case "$MEM_KB" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo $(( MEM_KB / 1024 )) ;;
+    esac
+}
+
+bbr_effective_memory_mb() {
+    local REQUESTED_MB="$1" ACTUAL_MB="${2:-}"
+    [ -n "$ACTUAL_MB" ] || ACTUAL_MB=$(bbr_physical_memory_mb)
+    case "$REQUESTED_MB" in ''|*[!0-9]*) return 1 ;; esac
+    case "$ACTUAL_MB" in ''|*[!0-9]*) ACTUAL_MB=0 ;; esac
+    if [ "$ACTUAL_MB" -gt 0 ] && [ "$REQUESTED_MB" -gt "$ACTUAL_MB" ]; then
+        echo "$ACTUAL_MB"
+    else
+        echo "$REQUESTED_MB"
+    fi
+}
+
+bbr_buffer_cap_bytes() {
+    local MEM_MB="$1"
+    case "$MEM_MB" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$MEM_MB" -gt 0 ] || return 1
+    echo $(( MEM_MB * 1048576 / 4 ))
+}
+
+bbr_conntrack_max_for_memory() {
+    local MEM_MB="$1"
+    if [ "$MEM_MB" -lt 1024 ]; then
+        echo 131072
+    elif [ "$MEM_MB" -lt 2048 ]; then
+        echo 262144
+    elif [ "$MEM_MB" -lt 4096 ]; then
+        echo 524288
+    else
+        echo 1048576
+    fi
+}
+
 bbr_generate_config() {
-    local RMEM=$1 WMEM=$2 TCP_MEM=$3 NOTSENT=$4 ADV_WIN=$5 \
-          MIN_FREE=$6 SWAPPINESS=$7 TCP_RMEM_DEFAULT=$8 PROFILE_NAME="${9:-default}"
+    local RMEM=$1 WMEM=$2 NOTSENT=$3 SWAPPINESS=$4 \
+          PROFILE_NAME="${5:-default}" ENABLE_FORWARD="${6:-0}"
     cat << EOF
 # BBR TCP 调优配置 — 生成时间：$(date)
 # 预设：${PROFILE_NAME}
 # ── 内存管理 ──
 vm.swappiness = ${SWAPPINESS}
-vm.min_free_kbytes = ${MIN_FREE}
 
 # ── BBR 核心 ──
 net.core.default_qdisc = fq
@@ -1160,44 +1263,25 @@ net.ipv4.tcp_congestion_control = bbr
 # ── 缓冲区 ──
 net.core.rmem_max = ${RMEM}
 net.core.wmem_max = ${WMEM}
-net.ipv4.tcp_rmem = 32768 ${TCP_RMEM_DEFAULT} ${RMEM}
-net.ipv4.tcp_wmem = 32768 ${TCP_RMEM_DEFAULT} ${WMEM}
-net.ipv4.tcp_mem = ${TCP_MEM}
-net.ipv4.tcp_adv_win_scale = ${ADV_WIN}
+net.ipv4.tcp_rmem = 4096 131072 ${RMEM}
+net.ipv4.tcp_wmem = 4096 16384 ${WMEM}
 net.ipv4.tcp_notsent_lowat = ${NOTSENT}
 
 # ── 连接质量 ──
 net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_fastopen_blackhole_timeout_sec = 0
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_ecn = 2
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_keepalive_time = 60
 
 # ── UDP 缓冲（QUIC / Hysteria2 / TUIC 代理）──
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 EOF
 
-    # 中转机 / 落地机 / 线路落地机 共同需要的转发与 conntrack
+    # 场景预设的并发参数不依赖内核转发，用户态代理同样受益。
     case "$PROFILE_NAME" in
         relay|landing|line_landing)
-            local IPV6_IFACE
-            IPV6_IFACE=$(bbr_default_ipv6_iface)
-            if [ -n "$IPV6_IFACE" ]; then
-                cat << EOF
-
-# 开启 IPv6 forwarding 前保留公网网卡的 SLAAC 路由通告
-net.ipv6.conf.${IPV6_IFACE}.accept_ra = 2
-EOF
-            fi
             cat << EOF
 
-# ── 转发与并发（中转/落地必备）──
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
+# ── 代理并发 ──
 net.core.somaxconn = 8192
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
@@ -1208,12 +1292,31 @@ EOF
             ;;
     esac
 
-    # 中转机额外的 conntrack 调优（大并发场景必需）
-    if [ "$PROFILE_NAME" = "relay" ]; then
+    if [ "$ENABLE_FORWARD" = 1 ]; then
+        local IPV6_IFACE
+        IPV6_IFACE=$(bbr_default_ipv6_iface)
         cat << EOF
 
-# ── conntrack（中转大并发必备）──
-net.netfilter.nf_conntrack_max = 1048576
+# ── 内核路由 / NAT ──
+net.ipv6.conf.default.accept_ra = 2
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+        if [ -n "$IPV6_IFACE" ]; then
+            cat << EOF
+net.ipv6.conf.${IPV6_IFACE}.accept_ra = 2
+EOF
+        fi
+    fi
+
+    if [ "$ENABLE_FORWARD" = 1 ] && [ "$PROFILE_NAME" = "relay" ]; then
+        local MEM_MB CONNTRACK_MAX
+        MEM_MB=$(bbr_physical_memory_mb)
+        CONNTRACK_MAX=$(bbr_conntrack_max_for_memory "$MEM_MB")
+        cat << EOF
+
+# ── conntrack（按物理内存分档）──
+net.netfilter.nf_conntrack_max = ${CONNTRACK_MAX}
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 EOF
@@ -1261,24 +1364,41 @@ bbr_check_limitnofile() {
     [ "$found" -eq 0 ] && return 0
 }
 
-bbr_confirm_apply() {
-    local RMEM=$1 WMEM=$2 TCP_MEM=$3 NOTSENT=$4 ADV_WIN=$5 \
-          MIN_FREE=$6 SWAP=$7 TCP_RMEM_DEFAULT=$8 \
-          LABEL_MODE=$9 LABEL_BUF=${10} PROFILE_NAME="${11:-default}"
+bbr_kernel_forwarding_confirm() {
+    local ANSWER
+    read -rp "  是否启用内核 IPv4/IPv6 转发？仅路由或 NAT 需要 (y/N，默认N): " ANSWER
+    [ -z "$ANSWER" ] && ANSWER="n"
+    echo "$ANSWER" | grep -qiE '^y(es)?$'
+}
 
-    local BUF_MB=$(( RMEM / 1048576 ))
+bbr_confirm_apply() {
+    local RMEM=$1 WMEM=$2 NOTSENT=$3 SWAP=$4 \
+          LABEL_MODE=$5 LABEL_BUF=$6 PROFILE_NAME="${7:-default}" ENABLE_FORWARD=0
+
+    bbr_preflight || return 1
+    case "$PROFILE_NAME" in
+        relay|landing|line_landing)
+            echo ""
+            bbr_kernel_forwarding_confirm && ENABLE_FORWARD=1
+            ;;
+    esac
+
     echo ""
     echo -e "  ${YELLOW}── 配置摘要 ──────────────────────────────${NC}"
     echo -e "  模式         : ${BOLD}$LABEL_MODE${NC}"
     echo -e "  缓冲区       : ${BOLD}${LABEL_BUF}MB${NC}  (rmem/wmem max)"
-    echo -e "  tcp_rmem default : ${BOLD}$(( TCP_RMEM_DEFAULT / 1048576 ))MB${NC}"
-    echo -e "  min_free_kbytes  : ${BOLD}${MIN_FREE}${NC}"
-    echo -e "  tcp_mem      : ${BOLD}${TCP_MEM}${NC}"
-    echo -e "  adv_win_scale: ${BOLD}${ADV_WIN}${NC}"
+    echo -e "  TCP min/default  : ${BOLD}接收 4KB/128KB · 发送 4KB/16KB${NC}"
+    echo -e "  全局 TCP 内存    : ${BOLD}由内核自动管理${NC}"
     echo -e "  swappiness   : ${BOLD}${SWAP}${NC}"
+    case "$PROFILE_NAME" in
+        relay|landing|line_landing)
+            [ "$ENABLE_FORWARD" = 1 ] \
+                && echo -e "  内核转发     : ${BOLD}启用${NC}" \
+                || echo -e "  内核转发     : ${BOLD}不修改${NC}"
+            ;;
+    esac
     echo -e "  ${YELLOW}──────────────────────────────────────────${NC}"
     echo ""
-    bbr_preflight || return 1
 
     # 先提示备份（默认Y）
     if [ -f "$SYSCTL_FILE" ]; then
@@ -1295,10 +1415,10 @@ bbr_confirm_apply() {
     if ! echo "${CONFIRM}" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
 
     local CONFIG
-    CONFIG=$(bbr_generate_config "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT" "$PROFILE_NAME")
-    case "$PROFILE_NAME" in
-        relay|landing|line_landing) ensure_conntrack_module || warn "无法预加载 nf_conntrack，将按内核实际支持情况应用" ;;
-    esac
+    CONFIG=$(bbr_generate_config "$RMEM" "$WMEM" "$NOTSENT" "$SWAP" "$PROFILE_NAME" "$ENABLE_FORWARD")
+    [ "$ENABLE_FORWARD" != 1 ] \
+        || ensure_conntrack_module \
+        || warn "无法预加载 nf_conntrack，将按内核实际支持情况应用"
     bbr_apply_sysctl "$CONFIG" || {
         error "BBR TCP 调优配置应用失败"
         return 1
@@ -1325,46 +1445,49 @@ bbr_buffer_target_mb() {
 
 bbr_auto_calc() {
     local MEM_MB=$1 LAT_MS=$2 BW_MBPS=$3 MEM_LBL=$4 LAT_LBL=$5 BW_LBL=$6
+    local ACTUAL_MEM_MB EFFECTIVE_MEM_MB
+    ACTUAL_MEM_MB=$(bbr_physical_memory_mb)
+    EFFECTIVE_MEM_MB=$(bbr_effective_memory_mb "$MEM_MB" "$ACTUAL_MEM_MB") || return 1
+    if [ "$EFFECTIVE_MEM_MB" -lt "$MEM_MB" ]; then
+        warn "所选内存 ${MEM_MB}MB 超过实际内存 ${ACTUAL_MEM_MB}MB，按实际内存计算"
+        MEM_LBL="${MEM_LBL}，按实际 ${ACTUAL_MEM_MB}MB"
+    fi
+    MEM_MB=$EFFECTIVE_MEM_MB
 
     local BDP_MB BUF_CALC
     BDP_MB=$(bbr_bdp_mb "$BW_MBPS" "$LAT_MS")
     BUF_CALC=$(bbr_buffer_target_mb "$BW_MBPS" "$LAT_MS")
 
-    local RMEM WMEM ADV_WIN NOTSENT TCP_RMEM_DEFAULT
-    if   [ "$BUF_CALC" -le 10 ];  then RMEM=12582912;   WMEM=12582912;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_CALC" -le 20 ];  then RMEM=20971520;   WMEM=20971520;   ADV_WIN=2; NOTSENT=131072;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_CALC" -le 32 ];  then RMEM=33554432;   WMEM=33554432;   ADV_WIN=2; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_CALC" -le 40 ];  then RMEM=41943040;   WMEM=41943040;   ADV_WIN=3; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_CALC" -le 64 ];  then RMEM=67108864;   WMEM=67108864;   ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=1048576
-    elif [ "$BUF_CALC" -le 128 ]; then RMEM=134217728;  WMEM=134217728;  ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=2097152
-    elif [ "$BUF_CALC" -le 256 ]; then RMEM=268435456;  WMEM=268435456;  ADV_WIN=3; NOTSENT=1048576; TCP_RMEM_DEFAULT=2097152
-    elif [ "$BUF_CALC" -le 512 ]; then RMEM=536870912;  WMEM=536870912;  ADV_WIN=3; NOTSENT=2097152; TCP_RMEM_DEFAULT=4194304
-    else                                RMEM=1073741824; WMEM=1073741824; ADV_WIN=3; NOTSENT=2097152; TCP_RMEM_DEFAULT=4194304
+    local RMEM WMEM NOTSENT
+    if   [ "$BUF_CALC" -le 10 ];  then RMEM=12582912;   NOTSENT=131072
+    elif [ "$BUF_CALC" -le 20 ];  then RMEM=20971520;   NOTSENT=131072
+    elif [ "$BUF_CALC" -le 32 ];  then RMEM=33554432;   NOTSENT=262144
+    elif [ "$BUF_CALC" -le 40 ];  then RMEM=41943040;   NOTSENT=262144
+    elif [ "$BUF_CALC" -le 64 ];  then RMEM=67108864;   NOTSENT=524288
+    elif [ "$BUF_CALC" -le 128 ]; then RMEM=134217728;  NOTSENT=524288
+    elif [ "$BUF_CALC" -le 256 ]; then RMEM=268435456;  NOTSENT=1048576
+    elif [ "$BUF_CALC" -le 512 ]; then RMEM=536870912;  NOTSENT=2097152
+    else                                RMEM=1073741824; NOTSENT=2097152
+    fi
+    WMEM=$RMEM
+
+    local BUFFER_CAP
+    BUFFER_CAP=$(bbr_buffer_cap_bytes "$MEM_MB") || return 1
+    if [ "$RMEM" -gt "$BUFFER_CAP" ]; then
+        warn "缓冲区 $(( RMEM / 1048576 ))MB 超过实际内存 ${MEM_MB}MB 的 25%，自动降级"
+        RMEM=$BUFFER_CAP
+        WMEM=$BUFFER_CAP
     fi
 
-    # 限制：缓冲区不超过物理内存一半
-    local HALF_MEM=$(( MEM_MB * 1048576 / 2 ))
-    if [ "$RMEM" -gt "$HALF_MEM" ]; then
-        warn "缓冲区 $(( RMEM / 1048576 ))MB 超过物理内存 ${MEM_MB}MB 的一半，自动降级"
-        RMEM=$HALF_MEM
-        WMEM=$HALF_MEM
-    fi
-
-    local MIN_FREE SWAP TCP_MEM
-    if   [ "$MEM_MB" -le 768  ]; then MIN_FREE=32768;  SWAP=10; TCP_MEM="32768 49152 98304"
-    elif [ "$MEM_MB" -le 1536 ]; then MIN_FREE=65536;  SWAP=10; TCP_MEM="49152 65536 131072"
-    elif [ "$MEM_MB" -le 4096 ]; then MIN_FREE=65536;  SWAP=5;  TCP_MEM="131072 196608 393216"
-    elif [ "$MEM_MB" -le 8192 ]; then MIN_FREE=131072; SWAP=5;  TCP_MEM="262144 393216 786432"
-    else                               MIN_FREE=262144; SWAP=5;  TCP_MEM="524288 786432 1572864"
-    fi
+    local SWAP=5
+    [ "$MEM_MB" -le 1536 ] && SWAP=10
 
     local BUF_MB=$(( RMEM / 1048576 ))
     echo ""
     echo -e "  BDP 估算：${BOLD}${BDP_MB}MB${NC}  →  推荐缓冲区：${BOLD}${BUF_MB}MB${NC}"
     echo -e "  内存：${MEM_LBL}  延迟：${LAT_LBL}  带宽：${BW_LBL}"
 
-    bbr_confirm_apply "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" \
-        "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT" \
+    bbr_confirm_apply "$RMEM" "$WMEM" "$NOTSENT" "$SWAP" \
         "自动计算（${MEM_LBL} / ${LAT_LBL} / ${BW_LBL}）" "$BUF_MB"
 }
 
@@ -1421,8 +1544,8 @@ bbr_menu_latency() {
 # ── 自动模式：内存子菜单 ─────────────────────────────────
 bbr_menu_auto() {
     # 自动检测系统内存并标注推荐档位
-    local MEM_KB; MEM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
-    local SYS_MEM_MB=$(( ${MEM_KB:-0} / 1024 ))
+    local SYS_MEM_MB
+    SYS_MEM_MB=$(bbr_physical_memory_mb)
 
     print_header "BBR 自动配置 — 选择内存"
     echo -e "  系统检测内存：${BOLD}${SYS_MEM_MB}MB${NC}"
@@ -1433,31 +1556,39 @@ bbr_menu_auto() {
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     echo ""
     read -rp "$(ui_prompt '选择内存 [0-6]: ')" CH
+    local SELECTED_MB SELECTED_LABEL EFFECTIVE_MB
     case "$CH" in
-        1) bbr_menu_latency 512   "512MB" ;;
-        2) bbr_menu_latency 1024  "1GB" ;;
-        3) bbr_menu_latency 2048  "2GB" ;;
-        4) bbr_menu_latency 4096  "4GB" ;;
-        5) bbr_menu_latency 8192  "8GB" ;;
-        6) bbr_menu_latency 16384 "16GB+" ;;
+        1) SELECTED_MB=512;   SELECTED_LABEL="512MB" ;;
+        2) SELECTED_MB=1024;  SELECTED_LABEL="1GB" ;;
+        3) SELECTED_MB=2048;  SELECTED_LABEL="2GB" ;;
+        4) SELECTED_MB=4096;  SELECTED_LABEL="4GB" ;;
+        5) SELECTED_MB=8192;  SELECTED_LABEL="8GB" ;;
+        6) SELECTED_MB=16384; SELECTED_LABEL="16GB+" ;;
         0) return ;;
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
-        *) warn "无效选项" ;;
+        *) warn "无效选项"; return ;;
     esac
+    EFFECTIVE_MB=$(bbr_effective_memory_mb "$SELECTED_MB" "$SYS_MEM_MB") || return 1
+    if [ "$EFFECTIVE_MB" -lt "$SELECTED_MB" ]; then
+        warn "所选内存 ${SELECTED_LABEL} 超过实际内存 ${SYS_MEM_MB}MB，后续按实际内存计算"
+        SELECTED_LABEL="${SELECTED_LABEL}（实际 ${SYS_MEM_MB}MB）"
+    fi
+    bbr_menu_latency "$EFFECTIVE_MB" "$SELECTED_LABEL"
 }
 
 # ── 手动模式：内存子菜单 ─────────────────────────────────
 bbr_menu_manual() {
     # 自动检测系统内存
-    local MEM_KB; MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    local MEM_MB=$(( MEM_KB / 1024 ))
+    local MEM_MB
+    MEM_MB=$(bbr_physical_memory_mb)
+    [ "$MEM_MB" -gt 0 ] || { error "无法读取物理内存"; return 1; }
 
     # ── 第一层：选择用途 ──
     print_header "BBR 手动配置 — 选择用途"
     echo -e "  检测到系统内存：${BOLD}${MEM_MB}MB${NC}"
     echo ""
     menu_div
-    echo -e "  ${BOLD}请选择 VPS 用途（决定转发/conntrack/窗口参数）${NC}"
+    echo -e "  ${BOLD}请选择 VPS 用途（决定并发与队列参数）${NC}"
     echo ""
     menu_item "1" "中转机  ${DIM}双向转发 / 大并发${NC}"
     menu_item "2" "落地机  ${DIM}跨境上行 / 大缓冲${NC}"
@@ -1542,56 +1673,45 @@ bbr_menu_manual() {
     esac
     WMEM=$RMEM
 
-    # 缓冲区不超过物理内存一半
-    local HALF_MEM=$(( MEM_MB * 1048576 / 2 ))
-    if [ "$RMEM" -gt "$HALF_MEM" ]; then
-        warn "缓冲区 ${BUF_LBL}MB 超过物理内存 ${MEM_MB}MB 的一半"
+    local BUFFER_CAP
+    BUFFER_CAP=$(bbr_buffer_cap_bytes "$MEM_MB") || return 1
+    if [ "$RMEM" -gt "$BUFFER_CAP" ]; then
+        warn "缓冲区 ${BUF_LBL}MB 超过物理内存 ${MEM_MB}MB 的 25%，高并发时可能造成内存压力"
         read -rp "  是否继续？(y/N，默认N): " GO
         [ -z "$GO" ] && GO="n"
         echo "$GO" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     fi
 
-    # ── 根据场景调整窗口/队列参数 ──
-    local ADV_WIN NOTSENT TCP_RMEM_DEFAULT
+    # ── 根据场景调整待发送队列 ──
+    local NOTSENT
     case "$PROFILE" in
         relay)
-            # 中转机：窗口标准、NOTSENT 小（降低单连接延迟）
-            ADV_WIN=2; NOTSENT=262144
-            [ "$BUF_LBL" -le 64 ] && TCP_RMEM_DEFAULT=1048576 || TCP_RMEM_DEFAULT=2097152
+            # 中转机：NOTSENT 小（降低单连接延迟）
+            NOTSENT=262144
             ;;
         landing)
-            # 落地机：窗口激进、NOTSENT 大（高吞吐）
-            ADV_WIN=3; NOTSENT=2097152
-            [ "$BUF_LBL" -le 64 ] && TCP_RMEM_DEFAULT=1048576 \
-            || { [ "$BUF_LBL" -le 256 ] && TCP_RMEM_DEFAULT=2097152 || TCP_RMEM_DEFAULT=4194304; }
+            # 落地机：NOTSENT 大（高吞吐）
+            NOTSENT=2097152
             ;;
         line_landing)
-            # 线路落地机：NOTSENT 极小（响应优先），adv_win=2 保证源站→落地高 BDP 接收
-            ADV_WIN=2; NOTSENT=131072
-            [ "$BUF_LBL" -le 64 ] && TCP_RMEM_DEFAULT=1048576 || TCP_RMEM_DEFAULT=2097152
+            # 线路落地机：NOTSENT 极小（响应优先）
+            NOTSENT=131072
             ;;
         default)
             # 通用：跟着缓冲区档位走
-            if   [ "$BUF_LBL" -le 32 ];  then ADV_WIN=2; NOTSENT=262144;  TCP_RMEM_DEFAULT=1048576
-            elif [ "$BUF_LBL" -le 64 ];  then ADV_WIN=3; NOTSENT=524288;  TCP_RMEM_DEFAULT=1048576
-            elif [ "$BUF_LBL" -le 256 ]; then ADV_WIN=3; NOTSENT=1048576; TCP_RMEM_DEFAULT=2097152
-            else                              ADV_WIN=3; NOTSENT=2097152; TCP_RMEM_DEFAULT=4194304
+            if   [ "$BUF_LBL" -le 32 ];  then NOTSENT=262144
+            elif [ "$BUF_LBL" -le 64 ];  then NOTSENT=524288
+            elif [ "$BUF_LBL" -le 256 ]; then NOTSENT=1048576
+            else                              NOTSENT=2097152
             fi ;;
     esac
 
-    # ── 内存相关参数按物理内存匹配 ──
-    local MIN_FREE SWAP TCP_MEM
-    if   [ "$MEM_MB" -le 768  ]; then MIN_FREE=32768;  SWAP=10; TCP_MEM="32768 49152 98304"
-    elif [ "$MEM_MB" -le 1536 ]; then MIN_FREE=65536;  SWAP=10; TCP_MEM="49152 65536 131072"
-    elif [ "$MEM_MB" -le 4096 ]; then MIN_FREE=65536;  SWAP=5;  TCP_MEM="131072 196608 393216"
-    elif [ "$MEM_MB" -le 8192 ]; then MIN_FREE=131072; SWAP=5;  TCP_MEM="262144 393216 786432"
-    else                               MIN_FREE=262144; SWAP=5;  TCP_MEM="524288 786432 1572864"
-    fi
+    local SWAP=5
+    [ "$MEM_MB" -le 1536 ] && SWAP=10
     # 中转机额外抬高 swappiness（容忍多进程）
     [ "$PROFILE" = "relay" ] && SWAP=10
 
-    bbr_confirm_apply "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" \
-        "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT" \
+    bbr_confirm_apply "$RMEM" "$WMEM" "$NOTSENT" "$SWAP" \
         "${SCENE_LABEL}（内存 ${MEM_MB}MB）" "$BUF_LBL" "$PROFILE"
 }
 
@@ -1888,116 +2008,91 @@ bbr_menu_initcwnd() {
 # ── 一键 TCP 预设（三种场景）────────────────────────────
 volcano_tcp_profile() {
     local PROFILE="${1:-balanced}"
-    local RMEM WMEM TCP_MEM NOTSENT ADV_WIN MIN_FREE SWAP TCP_RMEM_DEFAULT LABEL BUF_MB
+    local RMEM WMEM NOTSENT SWAP LABEL BUF_MB MEM_MB BUFFER_CAP
+    MEM_MB=$(bbr_physical_memory_mb)
+    if [ "$MEM_MB" -le 0 ]; then
+        warn "无法读取物理内存，按 512MB 保守计算"
+        MEM_MB=512
+    fi
     case "$PROFILE" in
         balanced)
-            # 根据实际内存动态调整 balanced 缓冲区，避免超过物理内存一半
-            local _MEM_MB; _MEM_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
-            if [ "${_MEM_MB:-0}" -lt 512 ]; then
-                RMEM=16777216; WMEM=16777216; BUF_MB=16
-            elif [ "${_MEM_MB:-0}" -lt 1024 ]; then
-                RMEM=33554432; WMEM=33554432; BUF_MB=32
+            if [ "$MEM_MB" -lt 512 ]; then
+                RMEM=16777216; BUF_MB=16
+            elif [ "$MEM_MB" -lt 1024 ]; then
+                RMEM=33554432; BUF_MB=32
             else
-                RMEM=67108864; WMEM=67108864; BUF_MB=64
+                RMEM=67108864; BUF_MB=64
             fi
-            WMEM=$RMEM; TCP_MEM="65536 131072 262144"
-            NOTSENT=262144; ADV_WIN=2; MIN_FREE=65536; SWAP=10
-            TCP_RMEM_DEFAULT=1048576
+            NOTSENT=262144; SWAP=10
             LABEL="均衡跨境  — 网页/代理/日常综合（推荐）" ;;
         latency)
-            RMEM=33554432; WMEM=33554432; TCP_MEM="49152 98304 196608"
-            NOTSENT=131072; ADV_WIN=1; MIN_FREE=65536; SWAP=10
-            TCP_RMEM_DEFAULT=524288; BUF_MB=32
+            RMEM=33554432; NOTSENT=131072; SWAP=10; BUF_MB=32
             LABEL="低延迟交互 — SSH/游戏/远程桌面/小包优先" ;;
         throughput)
             # 根据内存动态选缓冲区，万兆机器自动用大缓冲
-            local _MEM_MB; _MEM_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
-            if [ "${_MEM_MB:-0}" -lt 2048 ]; then
-                RMEM=67108864;   BUF_MB=64;   TCP_MEM="131072 196608 393216"; MIN_FREE=65536
-            elif [ "${_MEM_MB:-0}" -lt 4096 ]; then
-                RMEM=134217728;  BUF_MB=128;  TCP_MEM="131072 262144 524288"; MIN_FREE=131072
-            elif [ "${_MEM_MB:-0}" -lt 8192 ]; then
-                RMEM=268435456;  BUF_MB=256;  TCP_MEM="262144 393216 786432"; MIN_FREE=131072
+            if [ "$MEM_MB" -lt 2048 ]; then
+                RMEM=67108864;   BUF_MB=64
+            elif [ "$MEM_MB" -lt 4096 ]; then
+                RMEM=134217728;  BUF_MB=128
+            elif [ "$MEM_MB" -lt 8192 ]; then
+                RMEM=268435456;  BUF_MB=256
             else
-                RMEM=536870912;  BUF_MB=512;  TCP_MEM="524288 786432 1572864"; MIN_FREE=262144
+                RMEM=536870912;  BUF_MB=512
             fi
-            WMEM=$RMEM
-            NOTSENT=2097152; ADV_WIN=3; SWAP=5
-            TCP_RMEM_DEFAULT=4194304
+            NOTSENT=2097152; SWAP=5
             LABEL="高吞吐传输 — 大带宽/万兆/下载上传优先" ;;
         relay)
             # 中转机：两进两出，需要均衡缓冲+低延迟+大并发
-            local _MEM_MB; _MEM_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
-            if [ "${_MEM_MB:-0}" -lt 1024 ]; then
-                RMEM=33554432;  BUF_MB=32;   TCP_MEM="49152 98304 196608";  MIN_FREE=65536
-            elif [ "${_MEM_MB:-0}" -lt 2048 ]; then
-                RMEM=67108864;  BUF_MB=64;   TCP_MEM="65536 131072 262144"; MIN_FREE=65536
-            elif [ "${_MEM_MB:-0}" -lt 4096 ]; then
-                RMEM=134217728; BUF_MB=128;  TCP_MEM="131072 196608 393216"; MIN_FREE=131072
+            if [ "$MEM_MB" -lt 1024 ]; then
+                RMEM=33554432;  BUF_MB=32
+            elif [ "$MEM_MB" -lt 2048 ]; then
+                RMEM=67108864;  BUF_MB=64
+            elif [ "$MEM_MB" -lt 4096 ]; then
+                RMEM=134217728; BUF_MB=128
             else
-                RMEM=268435456; BUF_MB=256;  TCP_MEM="262144 393216 786432"; MIN_FREE=131072
+                RMEM=268435456; BUF_MB=256
             fi
-            WMEM=$RMEM
-            NOTSENT=262144; ADV_WIN=2; SWAP=10
-            TCP_RMEM_DEFAULT=1048576
+            NOTSENT=262144; SWAP=10
             LABEL="中转机 — 双向流量/大并发/均衡延迟与吞吐" ;;
         landing)
             # 落地机：流量主要是单向上行，跨境延迟高，需要大缓冲吃满带宽
-            local _MEM_MB; _MEM_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
-            if [ "${_MEM_MB:-0}" -lt 1024 ]; then
-                RMEM=67108864;   BUF_MB=64;   TCP_MEM="65536 131072 262144";   MIN_FREE=65536
-            elif [ "${_MEM_MB:-0}" -lt 2048 ]; then
-                RMEM=134217728;  BUF_MB=128;  TCP_MEM="131072 262144 524288";  MIN_FREE=131072
-            elif [ "${_MEM_MB:-0}" -lt 4096 ]; then
-                RMEM=268435456;  BUF_MB=256;  TCP_MEM="262144 393216 786432";  MIN_FREE=131072
+            if [ "$MEM_MB" -lt 1024 ]; then
+                RMEM=67108864;   BUF_MB=64
+            elif [ "$MEM_MB" -lt 2048 ]; then
+                RMEM=134217728;  BUF_MB=128
+            elif [ "$MEM_MB" -lt 4096 ]; then
+                RMEM=268435456;  BUF_MB=256
             else
-                RMEM=536870912;  BUF_MB=512;  TCP_MEM="524288 786432 1572864"; MIN_FREE=262144
+                RMEM=536870912;  BUF_MB=512
             fi
-            WMEM=$RMEM
-            NOTSENT=2097152; ADV_WIN=3; SWAP=5
-            TCP_RMEM_DEFAULT=4194304
+            NOTSENT=2097152; SWAP=5
             LABEL="落地机 — 跨境上行/大缓冲吃满带宽" ;;
         line_landing)
             # 线路落地机：直连用户/CN2/IPLC 线路，低延迟优先+中等吞吐
-            local _MEM_MB; _MEM_MB=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}') / 1024 ))
-            if [ "${_MEM_MB:-0}" -lt 1024 ]; then
-                RMEM=33554432;  BUF_MB=32;   TCP_MEM="49152 98304 196608";  MIN_FREE=65536
-            elif [ "${_MEM_MB:-0}" -lt 2048 ]; then
-                RMEM=67108864;  BUF_MB=64;   TCP_MEM="65536 131072 262144"; MIN_FREE=65536
-            elif [ "${_MEM_MB:-0}" -lt 4096 ]; then
-                RMEM=134217728; BUF_MB=128;  TCP_MEM="131072 262144 524288"; MIN_FREE=131072
+            if [ "$MEM_MB" -lt 1024 ]; then
+                RMEM=33554432;  BUF_MB=32
+            elif [ "$MEM_MB" -lt 2048 ]; then
+                RMEM=67108864;  BUF_MB=64
+            elif [ "$MEM_MB" -lt 4096 ]; then
+                RMEM=134217728; BUF_MB=128
             else
-                RMEM=268435456; BUF_MB=256;  TCP_MEM="262144 393216 786432"; MIN_FREE=131072
+                RMEM=268435456; BUF_MB=256
             fi
-            WMEM=$RMEM
-            NOTSENT=131072; ADV_WIN=2; SWAP=5
-            TCP_RMEM_DEFAULT=1048576
+            NOTSENT=131072; SWAP=5
             LABEL="线路落地机 — CN2/IPLC/直连用户/低延迟优先" ;;
         *) error "未知预设：$PROFILE"; return 1 ;;
     esac
 
-    bbr_preflight || return 1
-    case "$PROFILE" in
-        relay|landing|line_landing) ensure_conntrack_module || warn "无法预加载 nf_conntrack，将按内核实际支持情况应用" ;;
-    esac
-    echo -e "  预设：${BOLD}${LABEL}${NC}"
-    echo -e "  缓冲：${BOLD}${BUF_MB}MB${NC}  拥塞控制：${BOLD}BBR + fq${NC}"
-    echo ""
-    bbr_backup_sysctl || {
-        error "无法安全备份，已取消应用"
-        return 1
-    }
-    local CONFIG
-    CONFIG=$(bbr_generate_config "$RMEM" "$WMEM" "$TCP_MEM" "$NOTSENT" "$ADV_WIN" "$MIN_FREE" "$SWAP" "$TCP_RMEM_DEFAULT" "$PROFILE")
-    bbr_apply_sysctl "$CONFIG" || {
-        error "TCP 预设「${PROFILE}」应用失败"
-        return 1
-    }
-    case "$PROFILE" in
-        relay|landing|line_landing) bbr_check_limitnofile ;;
-    esac
-    info "TCP 预设「${PROFILE}」已应用 ✓"
-    return 0
+    WMEM=$RMEM
+    BUFFER_CAP=$(bbr_buffer_cap_bytes "$MEM_MB") || return 1
+    if [ "$RMEM" -gt "$BUFFER_CAP" ]; then
+        warn "预设缓冲区 ${BUF_MB}MB 超过实际内存 ${MEM_MB}MB 的 25%，已自动降级"
+        RMEM=$BUFFER_CAP
+        WMEM=$BUFFER_CAP
+        BUF_MB=$(( RMEM / 1048576 ))
+    fi
+
+    bbr_confirm_apply "$RMEM" "$WMEM" "$NOTSENT" "$SWAP" "$LABEL" "$BUF_MB" "$PROFILE"
 }
 
 # ── 智能 TCP 调优向导 ────────────────────────────────────
@@ -2014,9 +2109,8 @@ bbr_recommend_profile() {
 
 bbr_smart_wizard() {
     print_header "智能 TCP 调优向导"
-    local MEM_KB MEM_MB KERNEL CUR_CC
-    MEM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
-    MEM_MB=$(( ${MEM_KB:-0} / 1024 ))
+    local MEM_MB KERNEL CUR_CC
+    MEM_MB=$(bbr_physical_memory_mb)
     KERNEL=$(uname -r 2>/dev/null || echo "未知")
     CUR_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
 
@@ -2061,10 +2155,6 @@ bbr_smart_wizard() {
         *) warn "无效选项"; return ;;
     esac
 
-    echo ""
-    read -rp "  确认应用「${PROFILE}」？(Y/n，默认Y): " CONFIRM
-    [ -z "$CONFIRM" ] && CONFIRM="y"
-    if ! echo "$CONFIRM" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
     volcano_tcp_profile "$PROFILE" || return 1
 }
 

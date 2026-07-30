@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.11.4 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.11.5 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -66,11 +66,11 @@ sudo ./bbr-tune.sh
 
 ### 场景化预设（代理架构专用）
 
-| 预设 | 缓冲区（2GB 档） | NOTSENT | ADV_WIN | swap | 额外参数 |
-|------|-----------------|---------|---------|------|---------|
-| **中转机** `relay` | 64 MB | 256K（小） | 2 | 10 | 转发 + conntrack |
-| **落地机** `landing` | 128 MB | 2M（大） | 3 | 5 | 转发 |
-| **线路落地机** `line_landing` | 64 MB | 128K（极小） | 2 | 5 | 转发 |
+| 预设 | 缓冲区（2GB 档） | NOTSENT | swap | 额外参数 |
+|------|-----------------|---------|------|---------|
+| **中转机** `relay` | 64 MB | 256K（小） | 10 | 代理并发；可选转发 + conntrack |
+| **落地机** `landing` | 128 MB | 2M（大） | 5 | 代理并发；可选转发 |
+| **线路落地机** `line_landing` | 64 MB | 128K（极小） | 5 | 代理并发；可选转发 |
 
 **三种架构的流量模型：**
 
@@ -86,8 +86,9 @@ sudo ./bbr-tune.sh
 |------|--------|--------|-----------|
 | 缓冲区策略 | 中等（兼顾并发） | 大（吃满跨境带宽） | 中等（低延迟优先） |
 | NOTSENT | 小（降单连接延迟） | 大（高吞吐） | 极小（即时响应） |
-| ADV_WIN | 2（标准） | 3（接收激进） | 2（保高 BDP 接收） |
 | swappiness | 10（容忍多进程） | 5 | 5 |
+
+场景预设只默认写入代理并发参数。脚本会单独询问是否启用内核 IPv4/IPv6 转发，默认选择“否”；只有本机实际承担路由或 NAT 时才需要启用。
 
 ---
 
@@ -123,7 +124,7 @@ sudo ./bbr-tune.sh
 - **延迟：** 100ms 以内 / 100-200ms / 200ms 以上
 - **带宽：** 100M / 200M / 500M / 1G / 2G / 5G / 10G
 
-**BDP 估算：** `BDP(MB) = 带宽(Mbps) × RTT(ms) ÷ 8000`，缓冲目标按约 `1.5 × BDP` 向上取整，再匹配安全档位；结果超过物理内存一半自动降级。
+**BDP 估算：** `BDP(MB) = 带宽(Mbps) × RTT(ms) ÷ 8000`，缓冲目标按约 `1.5 × BDP` 向上取整，再匹配安全档位。所选内存高于实际物理内存时按实际值计算，最终缓冲不超过物理内存的 25%。
 
 ---
 
@@ -154,7 +155,7 @@ sudo ./bbr-tune.sh
 | 9 | 512 MB | 万兆 / 长距离（10G/100ms） |
 | 10 | 1024 MB | 极限（10G+/200ms+，需 8G+ 内存） |
 
-选定后窗口/队列参数按场景独立计算，并自动注入对应的转发/conntrack 参数。
+选定后待发送队列和并发参数按场景独立计算。内核转发仍需单独确认；仅启用转发的中转预设会写入按内存分档的 conntrack 参数。
 
 ---
 
@@ -207,7 +208,6 @@ sudo ./bbr-tune.sh
 ```ini
 # ── 内存管理 ──
 vm.swappiness
-vm.min_free_kbytes
 
 # ── BBR 核心 ──
 net.core.default_qdisc = fq
@@ -215,20 +215,13 @@ net.ipv4.tcp_congestion_control = bbr
 
 # ── 缓冲区 ──
 net.core.rmem_max / wmem_max
-net.ipv4.tcp_rmem / tcp_wmem
-net.ipv4.tcp_mem
-net.ipv4.tcp_adv_win_scale
+net.ipv4.tcp_rmem = 4096 131072 <上限>
+net.ipv4.tcp_wmem = 4096 16384 <上限>
 net.ipv4.tcp_notsent_lowat
 
 # ── 连接质量 ──
 net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_fastopen_blackhole_timeout_sec = 0
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_ecn = 2
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_keepalive_time = 60
 
 # ── UDP 缓冲（QUIC / Hysteria2 / TUIC 代理）──
 net.ipv4.udp_rmem_min = 16384
@@ -237,12 +230,9 @@ net.ipv4.udp_wmem_min = 16384
 
 ### 场景化预设额外参数
 
-**中转机 / 落地机 / 线路落地机共有的转发/并发参数：**
+**中转机 / 落地机 / 线路落地机共有的代理并发参数：**
 
 ```ini
-net.ipv4.ip_forward = 1
-net.ipv6.conf.<出口网卡>.accept_ra = 2       # forwarding 下继续接收 SLAAC RA
-net.ipv6.conf.all.forwarding = 1
 net.core.somaxconn = 8192
 net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
@@ -253,15 +243,24 @@ fs.file-max = 1048576                         # 高并发 fd 上限
 
 > **fd 上限提醒：** `fs.file-max` 仅系统总上限；单个代理进程的 fd 受 systemd `LimitNOFILE` 限制。应用场景预设后，脚本会自动检测常见代理 service（xray / sing-box / hysteria / tuic / v2ray / trojan / mihomo 等）的 `LimitNOFILE`，偏低时询问是否写入 `LimitNOFILE=1048576` 的 drop-in。
 
-**仅中转机额外（3 项 conntrack）：**
+**用户确认路由/NAT 用途后才写入：**
 
 ```ini
-net.netfilter.nf_conntrack_max = 1048576
+net.ipv6.conf.default.accept_ra = 2
+net.ipv6.conf.<出口网卡>.accept_ra = 2       # forwarding 下继续接收 SLAAC RA
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+```
+
+**启用转发的中转机额外写入 conntrack：**
+
+```ini
+net.netfilter.nf_conntrack_max = 131072 / 262144 / 524288 / 1048576
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 ```
 
-应用场景预设前自动 `modprobe nf_conntrack` 加载内核模块。
+`nf_conntrack_max` 按 `<1GB`、`1-2GB`、`2-4GB`、`≥4GB` 四档物理内存选择。仅用户启用内核转发时尝试 `modprobe nf_conntrack`。
 
 ---
 
@@ -271,12 +270,14 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 |------|------|
 | 内核支持检测 | 应用前检测内核 ≥ 4.9、`tcp_bbr` 模块 |
 | sysctl 权限检测 | 自动识别无特权容器并拦截 |
-| 物理内存校验 | 缓冲区超过物理内存一半自动降级 |
-| 事务应用 | BBR 核心参数失败时回滚运行参数，不覆盖旧持久化配置 |
-| 基线恢复 | 场景残留参数恢复首次调优前值，不写危险的猜测默认值 |
+| 物理内存校验 | 自动/智能模式按实际物理内存计算，缓冲上限 25%；手动超限需二次确认 |
+| 保守 TCP 默认值 | 每连接接收默认 128KB、发送默认 16KB；`tcp_mem` 等全局内存策略交还内核 |
+| 事务应用 | BBR 或 `fq` 写入失败、回读不一致时回滚运行参数，不覆盖旧持久化配置 |
+| 基线恢复 | 场景残留和旧版激进参数恢复首次调优前值，不写危险的猜测默认值 |
 | tc 所有权 | 默认不覆盖或删除第三方 qdisc；接管需 `FORCE <网卡>`，删除需 `DELETE <网卡>`，操作前保存快照 |
-| IPv6 RA | forwarding 场景设置出口网卡 `accept_ra=2`，避免 SLAAC 路由过期 |
-| conntrack 模块 | 场景预设前自动 modprobe |
+| 内核转发 | 场景预设默认不修改；路由/NAT 用途需用户明确启用 |
+| IPv6 RA | 启用 forwarding 时同时设置 `default` 与当前出口 `accept_ra=2` |
+| conntrack 模块 | 仅启用内核转发时尝试 modprobe，容量按内存分档 |
 | 自动备份 | 每次应用保存运行快照，可一键还原 |
 
 ---
@@ -300,19 +301,19 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 **sing-box 中转机（2GB 内存）：**
 ```
 智能向导 → 4) 中转机
-→ 自动写入 64MB 缓冲 + 转发 + conntrack（1048576 连接）
+→ 选择启用内核转发，写入 64MB 缓冲 + 转发 + 按实际内存分档的 conntrack
 ```
 
 **跨境落地机（8GB 内存 + 10Gbps）：**
 ```
-手动配置 → 2) 落地机 → 8 (512MB)
-→ 512MB 大缓冲吃满带宽 + 转发参数
+手动配置 → 2) 落地机 → 9 (512MB)
+→ 用户态代理选择不启用内核转发，写入 512MB 上限和代理并发参数
 ```
 
 **CN2 GIA 线路落地（1GB 内存）：**
 ```
 智能向导 → 6) 线路落地机
-→ 32MB 缓冲 + ADV_WIN=2（保高 BDP 接收）+ NOTSENT 极小（低延迟）+ 转发参数
+→ 32MB 缓冲 + NOTSENT 极小（低延迟）；仅路由/NAT 时启用转发
 配合 initcwnd 50
 ```
 
@@ -392,6 +393,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.11.5** | 自动/智能配置按实际物理内存计算并将缓冲上限收紧至 25%，TCP 每连接默认缓冲恢复保守值；停止覆盖 `tcp_mem`、`min_free_kbytes` 及过时/高风险全局参数；场景转发改为按需确认，IPv6 RA 覆盖默认与当前出口，conntrack 按内存分档，并对 BBR 与 `fq` 执行写后回读和失败回滚 |
 | **同步 V3.11.4** | 修复默认 `mq` 不能通过 `tc qdisc del` 删除导致限速应用及重启恢复失败，改用 `replace` 原子安装 HTB；外部限速会明确标注，输入 `DELETE <网卡>` 后可保存快照并删除 |
 | **同步 V3.11.3** | tc 限速支持显式强制接管外部 `tbf` / CAKE / HTB：默认拒绝覆盖并展示拓扑，输入 `FORCE <网卡>` 后保存诊断快照、替换 root qdisc，并持久化重启后的接管授权 |
 | **同步 V3.9.48** | 修复旧版生成的 `htb 1:` + `fq 100:` 限速因缺少状态文件被误判为外部 QoS；完整验证 tc 拓扑与本工具持久化标记后可安全修改或立即取消，第三方规则仍拒绝覆盖 |
