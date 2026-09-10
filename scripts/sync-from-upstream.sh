@@ -33,9 +33,11 @@ fi
 
 MODULE="$SOURCE_REPO/src/modules/bbr.sh"
 CORE="$SOURCE_REPO/src/lib/core.sh"
+REGRESSION_TEST="$SOURCE_REPO/tests/bbr-enhancements.sh"
 [ -f "$MODULE" ] || { echo "Missing upstream BBR module: $MODULE" >&2; exit 1; }
 [ -f "$CORE" ] || { echo "Missing upstream core: $CORE" >&2; exit 1; }
-git -C "$SOURCE_REPO" diff --quiet -- src/modules/bbr.sh src/lib/core.sh || {
+[ -f "$REGRESSION_TEST" ] || { echo "Missing upstream regression test: $REGRESSION_TEST" >&2; exit 1; }
+git -C "$SOURCE_REPO" diff HEAD --quiet -- src/modules/bbr.sh src/lib/core.sh tests/bbr-enhancements.sh || {
     echo "Upstream BBR/core changes must be committed before syncing" >&2
     exit 1
 }
@@ -58,7 +60,8 @@ grep -q '^# END SYNCED BBR MODULE$' "$SUFFIX" || { echo "Missing module end mark
     cat "$MODULE"
     cat "$SUFFIX"
 } > "$GENERATED"
-sed -i -E "s/(同步至 )V[0-9]+\.[0-9]+\.[0-9]+/\1${UPSTREAM_VERSION}/" "$GENERATED"
+sed -E "s/(同步至 )V[0-9]+\.[0-9]+\.[0-9]+/\1${UPSTREAM_VERSION}/" "$GENERATED" > "$TMP_DIR/versioned"
+mv "$TMP_DIR/versioned" "$GENERATED"
 bash -n "$GENERATED"
 
 if [ "$MODE" = check ]; then
@@ -68,6 +71,10 @@ if [ "$MODE" = check ]; then
     }
     [ "$(metadata_value UPSTREAM_MODULE_SHA256)" = "$MODULE_SHA256" ] || {
         echo "UPSTREAM.env module hash is stale" >&2
+        exit 1
+    }
+    cmp -s "$REGRESSION_TEST" "$ROOT/tests/bbr-enhancements.sh" || {
+        echo "BBR enhancement regression tests are not synchronized" >&2
         exit 1
     }
     echo "BBR standalone script matches ${UPSTREAM_VERSION} (${UPSTREAM_COMMIT})."
@@ -83,5 +90,7 @@ UPSTREAM_VERSION=${UPSTREAM_VERSION}
 UPSTREAM_MODULE_SHA256=${MODULE_SHA256}
 EOF
 mv "$TMP_DIR/UPSTREAM.env" "$METADATA"
-sed -i -E "s/(同步至 )V[0-9]+\.[0-9]+\.[0-9]+/\1${UPSTREAM_VERSION}/" "$ROOT/README.md"
+cp "$REGRESSION_TEST" "$ROOT/tests/bbr-enhancements.sh"
+sed -E "s/(同步至 )V[0-9]+\.[0-9]+\.[0-9]+/\1${UPSTREAM_VERSION}/" "$ROOT/README.md" > "$TMP_DIR/README.md"
+mv "$TMP_DIR/README.md" "$ROOT/README.md"
 echo "Synchronized BBR-tune with ${UPSTREAM_VERSION} (${UPSTREAM_COMMIT})."

@@ -8,6 +8,8 @@ export BBR_TUNE_TEST_MODE=1
 # shellcheck source=/dev/null
 source "$ROOT/bbr-tune.sh"
 
+BBR_TEST_SCRIPT="$ROOT/bbr-tune.sh" bash "$ROOT/tests/bbr-enhancements.sh"
+
 for fn in bbr_standalone_menu bbr_preflight bbr_runtime_snapshot bbr_ensure_baseline \
     bbr_restore_runtime_snapshot bbr_baseline_value bbr_apply_sysctl bbr_generate_config \
     bbr_physical_memory_mb bbr_effective_memory_mb bbr_buffer_cap_bytes bbr_conntrack_max_for_memory \

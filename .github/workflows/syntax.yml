@@ -13,10 +13,13 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Check shell syntax
-        run: bash -n bbr-tune.sh scripts/sync-from-upstream.sh tests/smoke.sh
+        run: |
+          for file in bbr-tune.sh scripts/sync-from-upstream.sh tests/smoke.sh tests/bbr-enhancements.sh; do
+            bash -n "$file"
+          done
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning -x bbr-tune.sh scripts/sync-from-upstream.sh tests/smoke.sh
+        run: shellcheck --severity=warning -x bbr-tune.sh scripts/sync-from-upstream.sh tests/smoke.sh tests/bbr-enhancements.sh
 
       - name: Verify upstream extraction
         run: scripts/sync-from-upstream.sh --check
