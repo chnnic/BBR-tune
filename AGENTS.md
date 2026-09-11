@@ -13,3 +13,12 @@ The BBR behavior in this repository is generated from `chnnic/SSH-Hardening/src/
 - Push `SSH-Hardening` and `BBR-tune` in the same work item when BBR behavior changes.
 
 Never place access tokens or cloud credentials in repository files or command history.
+
+## Offline delivery requirement
+
+For every upstream script version update, the user also requires the matching
+SSH-Hardening offline package to be built, validated, and published in GitHub
+Releases, with README direct/proxy download links on that same version. Follow
+the upstream AGENTS.md release checklist and wait for release verification before
+reporting the paired update complete. A source push or BBR synchronization alone
+does not complete that delivery. Do not invent a separate BBR-tune installer.
