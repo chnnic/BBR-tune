@@ -10,6 +10,19 @@ source "$ROOT/bbr-tune.sh"
 
 BBR_TEST_SCRIPT="$ROOT/bbr-tune.sh" bash "$ROOT/tests/bbr-enhancements.sh"
 
+[[ $(LC_ALL=C vis_len $'\033[31m中文\033[0m é') = 6 ]] || { echo 'Standalone UTF-8 width mismatch' >&2; exit 1; }
+(
+    safe_clear() { :; }
+    # shellcheck disable=SC2034 # used indirectly by menu_read
+    CHOICE=
+    OUTPUT=$(menu_read CHOICE test <<< 00; echo SURVIVED)
+    [[ "$OUTPUT" != *SURVIVED* ]] || exit 1
+    menu_read CHOICE test <<< 0
+    ui_pause <<< 00 # Returning must not require another keypress.
+    OUTPUT=$(ui_pause <<< 00; echo SURVIVED)
+    [[ "$OUTPUT" != *SURVIVED* ]] || exit 1
+)
+
 for fn in bbr_standalone_menu bbr_preflight bbr_runtime_snapshot bbr_ensure_baseline \
     bbr_restore_runtime_snapshot bbr_baseline_value bbr_apply_sysctl bbr_generate_config \
     bbr_physical_memory_mb bbr_effective_memory_mb bbr_buffer_cap_bytes bbr_conntrack_max_for_memory \

@@ -2,7 +2,7 @@
 
 # ============================================================
 #  BBR TCP 调优工具 — 银趴火山帮
-#  从 VPS 开荒脚本独立提取（同步至 V3.12.9）
+#  从 VPS 开荒脚本独立提取（同步至 V3.12.10）
 #  含场景化预设：中转机 / 落地机 / 线路落地机
 #  V3.11.6: tc 运行规则丢失时识别保存状态并自动恢复
 #  V3.11.5: 收紧内存策略，移除激进全局参数，内核转发改为按需启用
@@ -84,11 +84,32 @@ default_iface() {
 
 # ── 字符长度（中文按 2，英文按 1）─────────────────────────
 vis_len() {
-    python3 -c "
-import unicodedata, sys
-s = sys.argv[1]
-print(sum(2 if unicodedata.east_asian_width(c) in ('W','F') else 1 for c in s))
-" "$1" 2>/dev/null || echo "${#1}"
+    printf '%s\n' "$1" | LC_ALL=C awk '
+        BEGIN { for (i=1; i<256; i++) byte[sprintf("%c", i)]=i }
+        {
+            gsub(/\033\[[0-?]*[ -\/]*[@-~]/, "")
+            for (i=1; i<=length($0); i++) {
+                c=byte[substr($0,i,1)]; n=0
+                if (c>=240) { c-=240; n=3 }
+                else if (c>=224) { c-=224; n=2 }
+                else if (c>=192) { c-=192; n=1 }
+                for (j=0; j<n && i<length($0); j++) c=c*64+byte[substr($0,++i,1)]-128
+                if (c<32 || (c>=127 && c<160) ||
+                    (c>=768 && c<=879) || (c>=6832 && c<=6911) ||
+                    (c>=7616 && c<=7679) || (c>=8203 && c<=8207) ||
+                    (c>=8400 && c<=8447) || (c>=65024 && c<=65039) ||
+                    (c>=65056 && c<=65071) || (c>=917760 && c<=917999)) continue
+                wide=(c>=4352 && c<=4447) || c==9001 || c==9002 ||
+                     (c>=11904 && c<=42191 && c!=12351) ||
+                     (c>=44032 && c<=55203) || (c>=63744 && c<=64255) ||
+                     (c>=65040 && c<=65049) || (c>=65072 && c<=65131) ||
+                     (c>=65281 && c<=65376) || (c>=65504 && c<=65510) ||
+                     (c>=127744 && c<=129791) || (c>=131072 && c<=262141)
+                width+=wide ? 2 : 1
+            }
+        }
+        END { print width+0 }
+    '
 }
 
 # ── 框线绘制 ──────────────────────────────────────────────
@@ -101,6 +122,7 @@ box_title() {
     local LEN; LEN=$(vis_len "$TEXT")
     local INNER=$((BOX_W - 2))
     local PAD_TOTAL=$(( INNER - LEN ))
+    [ "$PAD_TOTAL" -lt 0 ] && PAD_TOTAL=0
     local PAD_L=$(( PAD_TOTAL / 2 ))
     local PAD_R=$(( PAD_TOTAL - PAD_L ))
     printf '%*s' "$PAD_L" ''
@@ -127,7 +149,28 @@ print_header() {
 }
 
 ui_prompt() { printf '  %s›%s %s' "$CYAN$BOLD" "$NC" "$1"; }
-ui_pause() { echo ""; read -rp "$(ui_prompt '按 Enter 返回')" _; }
+menu_read() {
+    UI_RETURN_PENDING=0
+    read -rp "$(ui_prompt "$2")" "$1" || { UI_RETURN_PENDING=1; return 1; }
+    [ "${!1}" != "0" ] || UI_RETURN_PENDING=1
+    if [ "${!1}" = "00" ] && [ "${3:-}" != "defer-exit" ]; then
+        safe_clear
+        echo -e "${GREEN}已退出。${NC}"
+        exit 0
+    fi
+}
+ui_skip_return_pause() {
+    [ "${UI_RETURN_PENDING:-0}" = 1 ] || return 1
+    UI_RETURN_PENDING=0
+}
+ui_pause() {
+    # shellcheck disable=SC2034 # assigned indirectly by menu_read
+    local PAUSE_CH
+    ui_skip_return_pause && return 0
+    echo ""
+    menu_read PAUSE_CH '按 Enter / 0 返回，00 退出: ' || true
+    UI_RETURN_PENDING=0
+}
 menu_div() { echo -e "  ${DIM}${CYAN}$(printf '─%.0s' $(seq 1 38))${NC}"; }
 menu_group() { echo -e "  ${CYAN}${BOLD}◆ ${1}${NC}"; }
 menu_item() {
@@ -789,7 +832,7 @@ bbr_tcp_menu() {
         menu_item "2" "ECN + fallback"
         menu_item "3" "MTU 黑洞探测"
         menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
-        read -rp "$(ui_prompt '选择 [0-3]: ')" CH || return 0
+        menu_read CH '选择 [0-3]: ' || return 0
         case "$CH" in
             1) GROUP=TFO ;; 2) GROUP=ECN ;; 3) GROUP=MTU ;;
             0) return ;; 00) exit 0 ;; *) continue ;;
@@ -805,8 +848,8 @@ bbr_tcp_menu() {
             menu_item "2" "关闭（0）"
         fi
         menu_item "3" "恢复首次基线并退出管理"
-        menu_item "0" "取消"
-        read -rp "$(ui_prompt '选择操作 [0-3]: ')" ACTION || return 0
+        menu_pair "0" "取消" "00" "退出脚本" "$RED" "$RED"
+        menu_read ACTION '选择操作 [0-3]: ' || return 0
         case "$ACTION" in 1) MODE=on ;; 2) MODE=off ;; 3) MODE=system ;; *) continue ;; esac
         bbr_tcp_set "$GROUP" "$MODE" || warn "TCP 增强未应用，请查看上方原因"
         ui_pause
@@ -893,9 +936,9 @@ bbr_restore_sysctl() {
 
     local TOTAL=$(( i - 1 ))
     echo -e "  ${YELLOW}[d]${NC} 清除全部备份"
-    echo -e "  ${RED}[0]${NC} 返回"
+    menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     echo ""
-    read -rp "$(ui_prompt '选择备份编号: ')" CH
+    menu_read CH '选择备份编号: ' defer-exit || { rm -f "$LIST_FILE"; return 0; }
 
     case "$CH" in
         0) rm -f "$LIST_FILE"; return ;;
@@ -2023,7 +2066,7 @@ bbr_menu_bandwidth() {
     menu_item "7" "10 Gbps"
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     echo ""
-    read -rp "$(ui_prompt '选择带宽 [0-7]: ')" CH
+    menu_read CH '选择带宽 [0-7]: ' || return 0
     case "$CH" in
         1) bbr_auto_calc "$MEM_MB" "$LAT_MS" 100   "$MEM_LBL" "$LAT_LBL" "100Mbps" ;;
         2) bbr_auto_calc "$MEM_MB" "$LAT_MS" 200   "$MEM_LBL" "$LAT_LBL" "200Mbps" ;;
@@ -2036,28 +2079,31 @@ bbr_menu_bandwidth() {
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项" ;;
     esac
+    ui_pause
 }
 
 # ── 自动模式：延迟子菜单 ─────────────────────────────────
 bbr_menu_latency() {
     local MEM_MB=$1 MEM_LBL=$2
-    print_header "BBR 自动配置 — 选择延迟"
-    echo -e "  内存：${BOLD}${MEM_LBL}${NC}"
-    echo ""
-    menu_item "1" "100ms 以内  ${DIM}国内 / 亚洲${NC}"
-    menu_item "2" "100-200ms  ${DIM}跨国线路${NC}"
-    menu_item "3" "200ms 以上  ${DIM}跨洲长距离${NC}"
-    menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
-    echo ""
-    read -rp "$(ui_prompt '选择延迟 [0-3]: ')" CH
-    case "$CH" in
-        1) bbr_menu_bandwidth "$MEM_MB" 50  "$MEM_LBL" "100ms以内" ;;
-        2) bbr_menu_bandwidth "$MEM_MB" 150 "$MEM_LBL" "100-200ms" ;;
-        3) bbr_menu_bandwidth "$MEM_MB" 250 "$MEM_LBL" "200ms以上" ;;
-        0) return ;;
-        00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
-        *) warn "无效选项" ;;
-    esac
+    while true; do
+        print_header "BBR 自动配置 — 选择延迟"
+        echo -e "  内存：${BOLD}${MEM_LBL}${NC}"
+        echo ""
+        menu_item "1" "100ms 以内  ${DIM}国内 / 亚洲${NC}"
+        menu_item "2" "100-200ms  ${DIM}跨国线路${NC}"
+        menu_item "3" "200ms 以上  ${DIM}跨洲长距离${NC}"
+        menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
+        echo ""
+        menu_read CH '选择延迟 [0-3]: ' || return 0
+        case "$CH" in
+            1) bbr_menu_bandwidth "$MEM_MB" 50  "$MEM_LBL" "100ms以内" ;;
+            2) bbr_menu_bandwidth "$MEM_MB" 150 "$MEM_LBL" "100-200ms" ;;
+            3) bbr_menu_bandwidth "$MEM_MB" 250 "$MEM_LBL" "200ms以上" ;;
+            0) return ;;
+            00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
+            *) warn "无效选项" ;;
+        esac
+    done
 }
 
 # ── 自动模式：内存子菜单 ─────────────────────────────────
@@ -2066,33 +2112,35 @@ bbr_menu_auto() {
     local SYS_MEM_MB
     SYS_MEM_MB=$(bbr_physical_memory_mb)
 
-    print_header "BBR 自动配置 — 选择内存"
-    echo -e "  系统检测内存：${BOLD}${SYS_MEM_MB}MB${NC}"
-    echo ""
-    menu_pair "1" "512 MB" "2" "1 GB"
-    menu_pair "3" "2 GB" "4" "4 GB"
-    menu_pair "5" "8 GB" "6" "16 GB+"
-    menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
-    echo ""
-    read -rp "$(ui_prompt '选择内存 [0-6]: ')" CH
-    local SELECTED_MB SELECTED_LABEL EFFECTIVE_MB
-    case "$CH" in
-        1) SELECTED_MB=512;   SELECTED_LABEL="512MB" ;;
-        2) SELECTED_MB=1024;  SELECTED_LABEL="1GB" ;;
-        3) SELECTED_MB=2048;  SELECTED_LABEL="2GB" ;;
-        4) SELECTED_MB=4096;  SELECTED_LABEL="4GB" ;;
-        5) SELECTED_MB=8192;  SELECTED_LABEL="8GB" ;;
-        6) SELECTED_MB=16384; SELECTED_LABEL="16GB+" ;;
-        0) return ;;
-        00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
-        *) warn "无效选项"; return ;;
-    esac
-    EFFECTIVE_MB=$(bbr_effective_memory_mb "$SELECTED_MB" "$SYS_MEM_MB") || return 1
-    if [ "$EFFECTIVE_MB" -lt "$SELECTED_MB" ]; then
-        warn "所选内存 ${SELECTED_LABEL} 超过实际内存 ${SYS_MEM_MB}MB，后续按实际内存计算"
-        SELECTED_LABEL="${SELECTED_LABEL}（实际 ${SYS_MEM_MB}MB）"
-    fi
-    bbr_menu_latency "$EFFECTIVE_MB" "$SELECTED_LABEL"
+    while true; do
+        print_header "BBR 自动配置 — 选择内存"
+        echo -e "  系统检测内存：${BOLD}${SYS_MEM_MB}MB${NC}"
+        echo ""
+        menu_pair "1" "512 MB" "2" "1 GB"
+        menu_pair "3" "2 GB" "4" "4 GB"
+        menu_pair "5" "8 GB" "6" "16 GB+"
+        menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
+        echo ""
+        menu_read CH '选择内存 [0-6]: ' || return 0
+        local SELECTED_MB SELECTED_LABEL EFFECTIVE_MB
+        case "$CH" in
+            1) SELECTED_MB=512;   SELECTED_LABEL="512MB" ;;
+            2) SELECTED_MB=1024;  SELECTED_LABEL="1GB" ;;
+            3) SELECTED_MB=2048;  SELECTED_LABEL="2GB" ;;
+            4) SELECTED_MB=4096;  SELECTED_LABEL="4GB" ;;
+            5) SELECTED_MB=8192;  SELECTED_LABEL="8GB" ;;
+            6) SELECTED_MB=16384; SELECTED_LABEL="16GB+" ;;
+            0) return ;;
+            00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
+            *) warn "无效选项"; continue ;;
+        esac
+        EFFECTIVE_MB=$(bbr_effective_memory_mb "$SELECTED_MB" "$SYS_MEM_MB") || return 1
+        if [ "$EFFECTIVE_MB" -lt "$SELECTED_MB" ]; then
+            warn "所选内存 ${SELECTED_LABEL} 超过实际内存 ${SYS_MEM_MB}MB，后续按实际内存计算"
+            SELECTED_LABEL="${SELECTED_LABEL}（实际 ${SYS_MEM_MB}MB）"
+        fi
+        bbr_menu_latency "$EFFECTIVE_MB" "$SELECTED_LABEL"
+    done
 }
 
 # ── 手动模式：内存子菜单 ─────────────────────────────────
@@ -2102,32 +2150,39 @@ bbr_menu_manual() {
     MEM_MB=$(bbr_physical_memory_mb)
     [ "$MEM_MB" -gt 0 ] || { error "无法读取物理内存"; return 1; }
 
-    # ── 第一层：选择用途 ──
-    print_header "BBR 手动配置 — 选择用途"
-    echo -e "  检测到系统内存：${BOLD}${MEM_MB}MB${NC}"
-    echo ""
-    menu_div
-    echo -e "  ${BOLD}请选择 VPS 用途（决定并发与队列参数）${NC}"
-    echo ""
-    menu_item "1" "中转机  ${DIM}双向转发 / 大并发${NC}"
-    menu_item "2" "落地机  ${DIM}跨境上行 / 大缓冲${NC}"
-    menu_item "3" "线路落地机  ${DIM}低延迟优先${NC}"
-    menu_item "4" "通用单机  ${DIM}网页 / SSH / 服务${NC}"
-    menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
-    menu_div
-    echo ""
-    read -rp "$(ui_prompt '选择用途 [0-4]: ')" SCENE
-    local PROFILE SCENE_LABEL
-    case "$SCENE" in
-        1) PROFILE="relay";        SCENE_LABEL="中转机" ;;
-        2) PROFILE="landing";      SCENE_LABEL="落地机" ;;
-        3) PROFILE="line_landing"; SCENE_LABEL="线路落地机" ;;
-        4) PROFILE="default";      SCENE_LABEL="通用单机" ;;
-        0) return ;;
-        00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
-        *) warn "无效选项"; return ;;
-    esac
+    while true; do
+        # ── 第一层：选择用途 ──
+        print_header "BBR 手动配置 — 选择用途"
+        echo -e "  检测到系统内存：${BOLD}${MEM_MB}MB${NC}"
+        echo ""
+        menu_div
+        echo -e "  ${BOLD}请选择 VPS 用途（决定并发与队列参数）${NC}"
+        echo ""
+        menu_item "1" "中转机  ${DIM}双向转发 / 大并发${NC}"
+        menu_item "2" "落地机  ${DIM}跨境上行 / 大缓冲${NC}"
+        menu_item "3" "线路落地机  ${DIM}低延迟优先${NC}"
+        menu_item "4" "通用单机  ${DIM}网页 / SSH / 服务${NC}"
+        menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
+        menu_div
+        echo ""
+        menu_read SCENE '选择用途 [0-4]: ' || return 0
+        local PROFILE SCENE_LABEL
+        case "$SCENE" in
+            1) PROFILE="relay";        SCENE_LABEL="中转机" ;;
+            2) PROFILE="landing";      SCENE_LABEL="落地机" ;;
+            3) PROFILE="line_landing"; SCENE_LABEL="线路落地机" ;;
+            4) PROFILE="default";      SCENE_LABEL="通用单机" ;;
+            0) return ;;
+            00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
+            *) warn "无效选项"; continue ;;
+        esac
 
+        bbr_menu_manual_buffers "$MEM_MB" "$PROFILE" "$SCENE_LABEL"
+    done
+}
+
+bbr_menu_manual_buffers() {
+    local MEM_MB="$1" PROFILE="$2" SCENE_LABEL="$3"
     # ── 第二层：根据场景给出推荐档位提示 + 缓冲区选择 ──
     local RECOMMEND
     case "$PROFILE" in
@@ -2172,7 +2227,7 @@ bbr_menu_manual() {
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     menu_div
     echo ""
-    read -rp "$(ui_prompt '选择缓冲区 [0-10]: ')" CH
+    menu_read CH '选择缓冲区 [0-10]: ' || return 0
 
     local RMEM WMEM BUF_LBL
     case "$CH" in
@@ -2232,6 +2287,7 @@ bbr_menu_manual() {
 
     bbr_confirm_apply "$RMEM" "$WMEM" "$NOTSENT" "$SWAP" \
         "${SCENE_LABEL}（内存 ${MEM_MB}MB）" "$BUF_LBL" "$PROFILE"
+    ui_pause
 }
 
 # ── tc 限速菜单 ───────────────────────────────────────────
@@ -2267,7 +2323,7 @@ bbr_menu_tc() {
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     menu_div
     echo ""
-    read -rp "$(ui_prompt '选择限速 [0-7]: ')" CH
+    menu_read CH '选择限速 [0-7]: ' || return 0
 
     local RATE=0
     case "$CH" in
@@ -2490,7 +2546,7 @@ bbr_menu_initcwnd() {
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     menu_div
     echo ""
-    read -rp "$(ui_prompt '选择 initcwnd [0-4]: ')" CH
+    menu_read CH '选择 initcwnd [0-4]: ' || return 0
 
     local VAL
     case "$CH" in
@@ -2651,7 +2707,7 @@ bbr_smart_wizard() {
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     menu_div
     echo ""
-    read -rp "$(ui_prompt '选择预设 [0-7]: ')" CH
+    menu_read CH '选择预设 [0-7]: ' || return 0
 
     local PROFILE=""
     case "$CH" in
@@ -2926,7 +2982,7 @@ bbr_menu() {
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         menu_div
         echo ""
-        read -rp "$(ui_prompt '选择操作 [0-9]: ')" CH
+        menu_read CH '选择操作 [0-9]: ' || return 0
 
         case "$CH" in
             1) bbr_smart_wizard ;;
@@ -2969,7 +3025,7 @@ bbr_standalone_menu() {
         menu_pair "0" "退出" "00" "退出脚本" "$RED" "$RED"
         menu_div
         echo ""
-        read -rp "$(ui_prompt '选择操作 [0-11]: ')" CH
+        menu_read CH '选择操作 [0-11 / 00]: ' || return 0
         case "$CH" in
             1) bbr_smart_wizard ;;
             2) bbr_menu_auto ;;
