@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.12.10 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.13.0 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -59,21 +59,25 @@ sudo ./bbr-tune.sh
 
 ### 通用预设（普通 VPS）
 
-| 预设 | 缓冲区（按内存动态） | 适用 |
-|------|---------------------|------|
-| `balanced` 均衡跨境 | 16-64 MB | 网页 / 代理 / 日常综合 |
-| `latency` 低延迟交互 | 32 MB | SSH / 游戏 / 远程桌面 |
-| `throughput` 高吞吐 | 64-512 MB | 大带宽 / 万兆 / 下载上传 |
+| 预设 | 估算依据 | 缓冲区（≥1GB 内存） | 适用 |
+|------|----------|---------------------|------|
+| `balanced` 均衡跨境 | 1Gbps / 150ms | 40 MB | 网页 / 代理 / 日常综合 |
+| `latency` 低延迟交互 | 500Mbps / 100ms | 16 MB | SSH / 游戏 / 远程桌面 |
+| `throughput` 高吞吐 | 2.5Gbps / 200ms | 128 MB（需 ≥2GB 内存） | 大带宽 / 跨洋 / 下载上传 |
 
-只写入 BBR、缓冲区、连接质量和 UDP 相关参数，不修改 `/etc/sysctl.conf`。
+缓冲区 = min(2 × BDP, 物理内存 / 16)，按 4MB 向上取整、下限 8MB。`tcp_rmem/wmem` 上限对每条连接分别生效，因此按内存 1/16 封顶。
+
+只写入 BBR、缓冲区、连接质量和 UDP 相关参数。旧版写在本配置里的 `vm.swappiness` 会在下次应用时移交 `/etc/sysctl.conf`（仅当该文件未定义时追加一行），之后不再由本工具管理。
 
 ### 场景化预设（代理架构专用）
 
-| 预设 | 缓冲区（2GB 档） | NOTSENT | swap | 额外参数 |
-|------|-----------------|---------|------|---------|
-| **中转机** `relay` | 64 MB | 256K（小） | 10 | 代理并发；可选转发 + conntrack |
-| **落地机** `landing` | 128 MB | 2M（大） | 5 | 代理并发；可选转发 |
-| **线路落地机** `line_landing` | 64 MB | 128K（极小） | 5 | 代理并发；可选转发 |
+| 预设 | 估算依据 | 缓冲区（≥1GB 内存） | 额外参数 |
+|------|----------|---------------------|---------|
+| **中转机** `relay` | 1Gbps / 150ms | 40 MB | 代理并发；可选转发 + conntrack |
+| **落地机** `landing` | 1Gbps / 250ms | 64 MB | 代理并发；可选转发 |
+| **线路落地机** `line_landing` | 1Gbps / 60ms | 16 MB | 代理并发；可选转发 |
+
+所有预设的 `tcp_notsent_lowat` 统一为 128KB：它只限制尚未发送的数据，不影响在途窗口。
 
 **三种架构的流量模型：**
 
@@ -87,9 +91,7 @@ sudo ./bbr-tune.sh
 
 | 维度 | 中转机 | 落地机 | 线路落地机 |
 |------|--------|--------|-----------|
-| 缓冲区策略 | 中等（兼顾并发） | 大（吃满跨境带宽） | 中等（低延迟优先） |
-| NOTSENT | 小（降单连接延迟） | 大（高吞吐） | 极小（即时响应） |
-| swappiness | 10（容忍多进程） | 5 | 5 |
+| 缓冲区策略 | 中等（兼顾并发） | 大（覆盖长 RTT） | 小（低延迟优先） |
 
 场景预设只默认写入代理并发参数。脚本会单独询问是否启用内核 IPv4/IPv6 转发，默认选择“否”；只有本机实际承担路由或 NAT 时才需要启用。
 
@@ -127,7 +129,7 @@ sudo ./bbr-tune.sh
 - **延迟：** 100ms 以内 / 100-200ms / 200ms 以上
 - **带宽：** 100M / 200M / 500M / 1G / 2G / 5G / 10G
 
-**BDP 估算：** `BDP(MB) = 带宽(Mbps) × RTT(ms) ÷ 8000`，缓冲目标按约 `1.5 × BDP` 向上取整，再匹配安全档位。所选内存高于实际物理内存时按实际值计算，最终缓冲不超过物理内存的 25%。
+**BDP 估算：** `BDP(MB) = 带宽(Mbps) × RTT(ms) ÷ 8000`，缓冲取 `2 × BDP` 按 4MB 向上取整（下限 8MB），并不超过物理内存的 1/16。所选内存高于实际物理内存时按实际值计算。
 
 ---
 
@@ -211,12 +213,12 @@ sudo ./bbr-tune.sh
 ### TCP 增强与诊断
 
 - 主菜单 `11` 提供 TFO、ECN + fallback、MTU 黑洞探测的独立启用、关闭和恢复首次基线入口；只修改所选参数，界面显示运行值及中文开关状态、推荐值、保存值及基线，操作项标明目标值。浏览或升级脚本不会自动修改这些参数。
-- TFO/MTU 延续默认 `3`/`1`，ECN 默认保留系统策略；明确启用 ECN 时成对设置 `tcp_ecn=1` 和 `tcp_ecn_fallback=1`，不支持任一项则取消。
+- 预设默认只管理 MTU（`1`，按需探测）；TFO 与 ECN 默认保留系统策略，需在本菜单明确启用后才写入。明确启用 ECN 时成对设置 `tcp_ecn=1` 和 `tcp_ecn_fallback=1`，不支持任一项则取消。
 - 偏好与 sysctl 原子保存于 `/etc/sysctl.d/99-vps-bbr.conf`，切换预设后保持。预设读取一致的配置快照，提交前发现并发更新就取消并提示重试，不覆盖另一操作刚保存的偏好。恢复原值会退出本工具管理；没有首次基线时拒绝猜测默认值。
-- 本工具手动增强建议：TFO=`3`（客户端 + 服务端），ECN 主动启用时=`1`（入站 + 出站）并配合 fallback=`1`（异常回退），MTU=`1`（检测到黑洞后按需探测，不是关闭）。ECN 默认仍保留系统策略。
+- 本工具手动增强建议：TFO=`3`（客户端 + 服务端），ECN 主动启用时=`1`（入站 + 出站）并配合 fallback=`1`（异常回退），MTU=`1`（检测到黑洞后按需探测，不是关闭）。TFO、ECN 默认仍保留系统策略。
 - “开启”表示内核配置允许，不代表每条连接已实际使用或一定提速。TFO 需要应用配合，ECN 需对端及链路兼容；取值含义见 [Linux 内核文档](https://kernel.org/doc/html/latest/networking/ip-sysctl.html)。
 - 主菜单 `8` 只读诊断：实际网卡队列、参数漂移、重复配置来源/行号，以及 TCP 重传/监听队列溢出和 softnet 累计计数；累计计数不是本次调优的增量。
-- 默认 qdisc 不代表现有网卡已切换。fq 提供 pacing，其他队列下现代内核可使用 TCP 内部 pacing。
+- 默认 qdisc 不代表现有网卡已切换。应用预设后，若默认网卡仍是 `fq_codel` / `pfifo_fast` / `mq` 默认子队列，会提示立即切换为 `fq`；限速规则与外部 QoS 不受影响。fq 提供 pacing，其他队列下现代内核可使用 TCP 内部 pacing。
 
 ---
 
@@ -225,9 +227,6 @@ sudo ./bbr-tune.sh
 ### 通用预设
 
 ```ini
-# ── 内存管理 ──
-vm.swappiness
-
 # ── BBR 核心 ──
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -236,11 +235,10 @@ net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max / wmem_max
 net.ipv4.tcp_rmem = 4096 131072 <上限>
 net.ipv4.tcp_wmem = 4096 16384 <上限>
-net.ipv4.tcp_notsent_lowat
+net.ipv4.tcp_notsent_lowat = 131072
 
 # ── 连接质量 ──
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_mtu_probing = 1                 # TFO / ECN 仅在 TCP 增强中明确启用后写入
 
 # ── UDP 缓冲（QUIC / Hysteria2 / TUIC 代理）──
 net.ipv4.udp_rmem_min = 16384
@@ -257,7 +255,8 @@ net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.ip_local_port_range = 10000 65535   # 扩大出站端口，防中转高并发端口耗尽
 net.ipv4.tcp_max_tw_buckets = 500000         # 容纳更多 TIME_WAIT
-fs.file-max = 1048576                         # 高并发 fd 上限
+net.ipv4.ip_local_reserved_ports = <监听端口> # 当前监听的 ≥10000 端口，避免被出站连接占用（保留已有设置）
+fs.file-max = 1048576                         # 仅当原值更低时写入，不会降低 systemd 设置的极大值
 ```
 
 > **fd 上限提醒：** `fs.file-max` 仅系统总上限；单个代理进程的 fd 受 systemd `LimitNOFILE` 限制。应用场景预设后，脚本会自动检测常见代理 service（xray / sing-box / hysteria / tuic / v2ray / trojan / mihomo 等）的 `LimitNOFILE`，偏低时询问是否写入 `LimitNOFILE=1048576` 的 drop-in。
@@ -279,7 +278,7 @@ net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 ```
 
-`nf_conntrack_max` 按 `<1GB`、`1-2GB`、`2-4GB`、`≥4GB` 四档物理内存选择。仅用户启用内核转发时尝试 `modprobe nf_conntrack`。
+`nf_conntrack_max` 按 `<1GB`、`1-2GB`、`2-4GB`、`≥4GB` 四档物理内存选择。仅用户启用内核转发时尝试 `modprobe nf_conntrack`，并写入 `/etc/modules-load.d/vps-tools-conntrack.conf` 开机预加载（否则开机时 sysctl 早于模块加载，`net.netfilter.*` 会被跳过），同时在 `/etc/modprobe.d/vps-tools-conntrack.conf` 按 `max / 4` 设置哈希桶。切换到不含 conntrack 的预设时自动删除这两个文件。
 
 ---
 
@@ -289,7 +288,7 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 |------|------|
 | 内核支持检测 | 应用前检测内核 ≥ 4.9、`tcp_bbr` 模块 |
 | sysctl 权限检测 | 自动识别无特权容器并拦截 |
-| 物理内存校验 | 自动/智能模式按实际物理内存计算，缓冲上限 25%；手动超限需二次确认 |
+| 物理内存校验 | 自动/智能模式按实际物理内存计算，每连接缓冲上限为内存 1/16；手动超限需二次确认 |
 | 保守 TCP 默认值 | 每连接接收默认 128KB、发送默认 16KB；`tcp_mem` 等全局内存策略交还内核 |
 | 事务应用 | 所有待应用参数逐项及最终回读验证，失败时回滚；内核不存在的可选参数注释跳过，明确选择的增强参数必须完整支持 |
 | 基线恢复 | 场景残留和旧版激进参数恢复首次调优前值，不写危险的猜测默认值 |
@@ -320,19 +319,19 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 **sing-box 中转机（2GB 内存）：**
 ```
 智能向导 → 4) 中转机
-→ 选择启用内核转发，写入 64MB 缓冲 + 转发 + 按实际内存分档的 conntrack
+→ 选择启用内核转发，写入 40MB 缓冲 + 转发 + 按实际内存分档的 conntrack（开机预加载）
 ```
 
 **跨境落地机（8GB 内存 + 10Gbps）：**
 ```
-手动配置 → 2) 落地机 → 9 (512MB)
-→ 用户态代理选择不启用内核转发，写入 512MB 上限和代理并发参数
+自动配置 → 16GB+ → 200ms 以上 → 10G
+→ 按 2 × BDP 计算得到 512MB 上限（内存 1/16 封顶）；用户态代理选择不启用内核转发
 ```
 
 **CN2 GIA 线路落地（1GB 内存）：**
 ```
 智能向导 → 6) 线路落地机
-→ 32MB 缓冲 + NOTSENT 极小（低延迟）；仅路由/NAT 时启用转发
+→ 16MB 缓冲（1Gbps / 60ms 的 2 × BDP）；仅路由/NAT 时启用转发
 配合 initcwnd 50
 ```
 
@@ -412,6 +411,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.13.0** | 预设内容重整：缓冲改为 min(2×BDP, 内存/16)，预设按典型带宽/RTT 估算；`tcp_notsent_lowat` 统一 128KB；TFO 默认跟随系统；不再管理 `vm.swappiness`（旧值移交 sysctl.conf）；`fs.file-max` 只升不降；场景预设保留监听中的高位端口；conntrack 开机预加载并设置哈希桶；应用后可切换默认网卡为 fq。修复：还原备份前确认转发 / RA 改动；initcwnd 支持 IPv6 RA 路由；带 maxrate 的 root fq 识别为外部限速；换默认网卡后清理旧网卡限速；强制删除沿用检测到的网卡。主仓同步发布 V3.13.0 离线包 |
 | **同步 V3.12.10** | 补齐深层菜单 0/00 和 EOF 处理，修复 BBR 自动/手动向导返回层级，取消多余的返回停顿；同步不依赖 Python 的 UTF-8 宽度计算和导航回归测试；主仓同步发布同版本离线包 |
 | **同步 V3.12.9** | TCP 增强显示中文开关状态、推荐值和操作目标值，明确按需探测及协商条件；仅改显示，不改现有参数；增加只读显示及菜单回归测试 |
 | **同步 V3.12.7** | 修复 IPv6 RA/转发顺序、接口状态回滚、异常终止遗留锁、消失的旧参数恢复和预设并发覆盖；同步 33 组隔离回归场景，主仓另有真实 Linux 网络命名空间测试 |
