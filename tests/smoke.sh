@@ -26,7 +26,7 @@ BBR_TEST_SCRIPT="$ROOT/bbr-tune.sh" bash "$ROOT/tests/bbr-enhancements.sh"
 for fn in bbr_standalone_menu bbr_preflight bbr_runtime_snapshot bbr_ensure_baseline \
     bbr_restore_runtime_snapshot bbr_baseline_value bbr_apply_sysctl bbr_generate_config \
     bbr_physical_memory_mb bbr_effective_memory_mb bbr_buffer_cap_bytes bbr_conntrack_max_for_memory \
-    bbr_bdp_mb bbr_buffer_target_mb bbr_recommend_profile bbr_tc_qdisc_safe_to_replace \
+    bbr_bdp_mb bbr_buffer_bytes bbr_recommend_profile bbr_tc_qdisc_safe_to_replace \
     bbr_tc_current_rate bbr_tc_saved_values bbr_tc_saved_rate_display bbr_tc_rate_display \
     bbr_tc_snapshot_foreign bbr_tc_force_confirm bbr_tc_remove_confirm \
     bbr_tc_topology_matches bbr_tc_managed_artifact \
@@ -56,7 +56,7 @@ EOF
     # shellcheck disable=SC2329 # invoked indirectly by bbr_generate_config
     bbr_default_ipv6_iface() { echo eth0; }
     bbr_physical_memory_mb() { echo 512; }
-    CONFIG=$(bbr_generate_config 12582912 12582912 131072 10 relay 0)
+    CONFIG=$(bbr_generate_config 12582912 12582912 relay 0)
     grep -qx 'net.ipv4.tcp_rmem = 4096 131072 12582912' <<< "$CONFIG" || { echo "Unsafe receive defaults were generated" >&2; exit 1; }
     grep -qx 'net.ipv4.tcp_wmem = 4096 16384 12582912' <<< "$CONFIG" || { echo "Unsafe send defaults were generated" >&2; exit 1; }
     ! grep -qE '^(vm\.min_free_kbytes|net\.ipv4\.(tcp_mem|tcp_adv_win_scale|tcp_tw_reuse|tcp_fin_timeout|tcp_keepalive_time))[[:space:]]*=' <<< "$CONFIG" \
@@ -64,24 +64,27 @@ EOF
     ! grep -qE '^net\.ipv4\.ip_forward[[:space:]]*=' <<< "$CONFIG" || { echo "Forwarding was enabled without consent" >&2; exit 1; }
     ! grep -qE '^net\.netfilter\.nf_conntrack_max[[:space:]]*=' <<< "$CONFIG" || { echo "Conntrack was tuned without forwarding" >&2; exit 1; }
 
-    CONFIG=$(bbr_generate_config 12582912 12582912 131072 10 relay 1)
+    CONFIG=$(bbr_generate_config 12582912 12582912 relay 1)
     grep -qx 'net.ipv6.conf.default.accept_ra = 2' <<< "$CONFIG" || { echo "IPv6 forwarding profile is missing default accept_ra=2" >&2; exit 1; }
     grep -qx 'net.ipv6.conf.eth0.accept_ra = 2' <<< "$CONFIG" || { echo "IPv6 forwarding profile is missing interface accept_ra=2" >&2; exit 1; }
     grep -qx 'net.netfilter.nf_conntrack_max = 131072' <<< "$CONFIG" || { echo "Conntrack was not scaled for 512MB" >&2; exit 1; }
 )
 
 [[ "$(bbr_effective_memory_mb 16384 512)" = 512 ]] || { echo "Selected memory was not clamped to physical RAM" >&2; exit 1; }
-[[ "$(bbr_buffer_cap_bytes 512)" = 134217728 ]] || { echo "Buffer cap is not 25 percent of RAM" >&2; exit 1; }
+[[ "$(bbr_buffer_cap_bytes 512)" = 33554432 ]] || { echo "Per-connection buffer cap is not 1/16 of RAM" >&2; exit 1; }
+[[ "$(bbr_buffer_bytes 1000 150 4096)" = 41943040 ]] || { echo "2xBDP buffer for 1Gbps/150ms is not 40MB" >&2; exit 1; }
+[[ "$(bbr_buffer_bytes 100 50 4096)" = 8388608 ]] || { echo "Small-BDP buffer floor is not 8MB" >&2; exit 1; }
+! bbr_managed_keys | grep -qx 'vm.swappiness' || { echo "BBR still manages vm.swappiness" >&2; exit 1; }
 ! bbr_managed_keys | grep -qx 'vm.min_free_kbytes' || { echo "Retired settings could be captured as a new baseline" >&2; exit 1; }
 [[ "$(bbr_conntrack_max_for_memory 512)" = 131072 ]] || { echo "512MB conntrack tier is wrong" >&2; exit 1; }
 [[ "$(bbr_conntrack_max_for_memory 2048)" = 524288 ]] || { echo "2GB conntrack tier is wrong" >&2; exit 1; }
 
 (
     bbr_physical_memory_mb() { echo 512; }
-    bbr_confirm_apply() { printf '%s %s %s %s\n' "$1" "$2" "$3" "$4"; }
+    bbr_confirm_apply() { printf '%s %s\n' "$1" "$2"; }
     AUTO_RESULT=$(bbr_auto_calc 16384 250 10240 16GB+ 200ms以上 10Gbps)
     AUTO_PARAMS=$(tail -n 1 <<< "$AUTO_RESULT")
-    [[ "$AUTO_PARAMS" = '134217728 134217728 2097152 10' ]] \
+    [[ "$AUTO_PARAMS" = '33554432 33554432' ]] \
         || { echo "512MB auto calculation trusted a 16GB selection: $AUTO_PARAMS" >&2; exit 1; }
 )
 
@@ -142,7 +145,7 @@ EOF
     chmod +x "$TC_BIN_DIR/tc"
     cat > "$TC_HELPER" <<'EOF'
 #!/bin/sh
-# VPS_TOOLS_TC_HELPER_VERSION=2
+# VPS_TOOLS_TC_HELPER_VERSION=3
 [ "${1:-}" = apply ] || exit 1
 : > "$TC_MARKER"
 EOF
@@ -300,7 +303,8 @@ EOF
 [[ -z "$(bbr_route_token 'default dev eth0 proto static metric 100' via)" ]] || { echo "Direct route invented a gateway" >&2; exit 1; }
 [[ "$(bbr_route_strip_cwnd 'default via 192.0.2.1 dev eth0 initcwnd 50 initrwnd 50')" = 'default via 192.0.2.1 dev eth0' ]] || { echo "Route cwnd cleanup failed" >&2; exit 1; }
 [[ "$(bbr_bdp_mb 100 50)" != 0.00 ]] || { echo "BDP estimate was truncated to zero" >&2; exit 1; }
-[[ "$(bbr_buffer_target_mb 100 50)" = 1 ]] || { echo "BDP buffer rounding failed" >&2; exit 1; }
+[[ "$(bbr_route_strip_cwnd 'default via fe80::1 dev eth0 proto ra metric 1024 expires 1795sec pref medium')" = 'default via fe80::1 dev eth0 proto ra metric 1024 pref medium' ]] || { echo "RA route expires token was kept" >&2; exit 1; }
+! bbr_tc_root_safe_to_replace 'qdisc fq 8001: root refcnt 2 maxrate 100Mbit' || { echo "Foreign fq maxrate was treated as replaceable" >&2; exit 1; }
 [[ "$(bbr_recommend_profile 4095)" = balanced ]] || { echo "Sub-4GB recommendation changed" >&2; exit 1; }
 [[ "$(bbr_recommend_profile 4096)" = throughput ]] || { echo "4GB recommendation is not throughput" >&2; exit 1; }
 
@@ -310,7 +314,7 @@ awk 'p && /^TC_HELPER_EOF$/{exit} /<< '\''TC_HELPER_EOF'\''/{p=1; next} p{print}
 awk 'p && /^CWND_HELPER_EOF$/{exit} /<< '\''CWND_HELPER_EOF'\''/{p=1; next} p{print}' "$MODULE" > "$CWND_HELPER"
 sh -n "$TC_HELPER"
 sh -n "$CWND_HELPER"
-grep -qxF '# VPS_TOOLS_TC_HELPER_VERSION=2' "$TC_HELPER" \
+grep -qxF '# VPS_TOOLS_TC_HELPER_VERSION=3' "$TC_HELPER" \
     || { echo "Generated tc helper is missing its compatibility version" >&2; exit 1; }
 grep -q -- '--bbr-reconcile-tc)' "$ROOT/bbr-tune.sh" \
     || { echo "Standalone tc reconciliation CLI dispatch is missing" >&2; exit 1; }
