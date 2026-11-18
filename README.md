@@ -1,6 +1,6 @@
 # BBR TCP 调优工具
 
-> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.13.5 独立提取
+> **银趴火山帮** 出品 · 从 [VPS 开荒脚本](https://github.com/chnnic/SSH-Hardening) 同步至 V3.13.11 独立提取
 
 专注 TCP 性能调优的交互式工具，支持智能向导、场景化预设（中转/落地/线路落地）、自动 BDP 计算、手动配置、tc 限速（htb 整形 + fq pacing）、initcwnd 调整。
 
@@ -48,7 +48,7 @@ sudo ./bbr-tune.sh
   4  限速设置               5  initcwnd 设置
   6  备份 TCP 配置          7  还原 TCP 配置
   8  BBR 诊断
-  11 TCP 增强（TFO / ECN / MTU）
+  11 TCP 增强（TFO / ECN / MTU）  12 conntrack 调优
   9  更新脚本              10  设置 bbr 快捷键
   0  退出                  00  退出脚本
 ```
@@ -160,7 +160,7 @@ sudo ./bbr-tune.sh
 | 9 | 512 MB | 万兆 / 长距离（10G/100ms） |
 | 10 | 1024 MB | 极限（10G+/200ms+，需 8G+ 内存） |
 
-选定后待发送队列和并发参数按场景独立计算。内核转发仍需单独确认；仅启用转发的中转预设会写入按内存分档的 conntrack 参数。
+选定后待发送队列和并发参数按场景独立计算。内核转发仍需单独确认；中转 / 落地 / 线路落地预设都会写入按内存分档的 conntrack 参数（默认预设仅在 conntrack 已加载时写入）。
 
 ---
 
@@ -271,7 +271,7 @@ net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 ```
 
-**启用转发的中转机额外写入 conntrack：**
+**场景预设与「12 conntrack 调优」写入 conntrack：**
 
 ```ini
 net.netfilter.nf_conntrack_max = 131072 / 262144 / 524288 / 1048576
@@ -279,7 +279,7 @@ net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 ```
 
-`nf_conntrack_max` 按 `<1GB`、`1-2GB`、`2-4GB`、`≥4GB` 四档物理内存选择。仅用户启用内核转发时尝试 `modprobe nf_conntrack`，并写入 `/etc/modules-load.d/vps-tools-conntrack.conf` 开机预加载（否则开机时 sysctl 早于模块加载，`net.netfilter.*` 会被跳过），同时在 `/etc/modprobe.d/vps-tools-conntrack.conf` 按 `max / 4` 设置哈希桶。切换到不含 conntrack 的预设时自动删除这两个文件。
+`nf_conntrack_max` 按 `<1GB`、`1-2GB`、`2-4GB`、`≥4GB` 四档物理内存选择且只升不降，超时只缩不延长（内核默认 established 长达 5 天）。新内核在 1GB 及以下内存时默认上限只有约 内存MB×8（1GB ≈ 7680），防火墙 / NAT / 转发 / Docker 连接一多就会 `nf_conntrack: table full, dropping packet`。应用时 `modprobe nf_conntrack`，并写入 `/etc/modules-load.d/vps-tools-conntrack.conf` 开机预加载（否则开机时 sysctl 早于模块加载，`net.netfilter.*` 会被跳过），同时在 `/etc/modprobe.d/vps-tools-conntrack.conf` 按 `max / 4` 设置哈希桶。菜单 `12` 可单独调整这三项（只替换 conntrack 行、记录基线、可还原）；状态栏显示 conntrack 使用率，超过 90% 或上限偏小时提示。
 
 ---
 
@@ -296,7 +296,7 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 | tc 所有权 | 默认不覆盖或删除第三方 qdisc；接管需 `FORCE <网卡>`，删除需 `DELETE <网卡>`，操作前保存快照 |
 | 内核转发 | 场景预设默认不修改；路由/NAT 用途需用户明确启用 |
 | IPv6 RA | 启用 forwarding 时同时设置 `default` 与当前出口 `accept_ra=2` |
-| conntrack 模块 | 仅启用内核转发时尝试 modprobe，容量按内存分档 |
+| conntrack 模块 | 场景预设或 conntrack 调优时 modprobe 并开机预加载，容量按内存分档，只升不降 |
 | 自动备份 | 每次应用保存运行快照，可一键还原 |
 
 ---
@@ -412,6 +412,7 @@ https://github.com/chnnic/SSH-Hardening
 
 | 版本 | 主要变更 |
 |------|---------|
+| **同步 V3.13.11** | 修复 conntrack 表满丢包：新增菜单「12 conntrack 调优」，按内存调大上限（1GB → 131072，只升不降）、established 超时 2 小时、time_wait 30 秒（只缩不延长），写入 BBR 配置并记录基线、开机预加载；落地 / 线路落地 / 未开转发的中转预设也会调整，默认预设在 conntrack 已加载时调整；状态栏显示 conntrack 使用率并在接近满载时警告。主仓同步发布 V3.13.11 离线包 |
 | **同步 V3.13.5** | 审计修复：还原不含转发参数的旧备份时保留当前转发 / RA；重跑预设一路回车不再从持久化中删掉转发设置；还原需要改转发 / RA 时单独确认；内核默认为空的保留端口备份可正常还原；mq 网卡切换 fq 只替换内核默认子队列，不碰 ingress/clsact 和外部 tbf/htb；回滚期间屏蔽信号；缺少基线的旧参数标记为原值未知，不再补采调优值；旧安装写入的 fs.file-max 继续持久化；限速自动对账不强制覆盖新出现的外部队列；LimitNOFILE drop-in 原子写入独立文件。主仓同步发布 V3.13.5 离线包 |
 | **同步 V3.13.2** | TCP 增强新增“一键推荐”：TFO=3、ECN=1 + fallback=1、MTU=1 同一事务写入，先显示当前值与目标值并确认，任一项不支持则整体回滚。主仓同步发布 V3.13.2 离线包 |
 | **同步 V3.13.1** | 修复场景预设在监听端口含连续端口时整次失败（保留端口按内核回读格式合并区间）；`fs.file-max` 原值更大时自动恢复；“不再管理的场景参数”提示显示当前值与原值；swappiness 仅在应用成功后才移交。主仓同步发布 V3.13.1 离线包 |

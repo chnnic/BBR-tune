@@ -23,9 +23,19 @@ BBR_TEST_SCRIPT="$ROOT/bbr-tune.sh" bash "$ROOT/tests/bbr-enhancements.sh"
     [[ "$OUTPUT" != *SURVIVED* ]] || exit 1
 )
 
+# The standalone menu exposes conntrack tuning (entry 12).
+(
+    print_header() { :; }; bbr_print_status() { :; }; safe_clear() { :; }
+    bbr_conntrack_menu() { echo CONNTRACK_MENU; }
+    ui_pause() { :; }
+    OUTPUT=$(printf '12\n0\n' | bbr_standalone_menu 2>&1)
+    [[ "$OUTPUT" = *'conntrack 调优'* && "$OUTPUT" = *CONNTRACK_MENU* ]] || { echo "Standalone menu does not offer conntrack tuning" >&2; exit 1; }
+)
+
 for fn in bbr_standalone_menu bbr_preflight bbr_runtime_snapshot bbr_ensure_baseline \
     bbr_restore_runtime_snapshot bbr_baseline_value bbr_apply_sysctl bbr_generate_config \
     bbr_physical_memory_mb bbr_effective_memory_mb bbr_buffer_cap_bytes bbr_conntrack_max_for_memory \
+    bbr_conntrack_tune bbr_conntrack_menu bbr_conntrack_status_line \
     bbr_bdp_mb bbr_buffer_bytes bbr_recommend_profile bbr_tc_qdisc_safe_to_replace \
     bbr_tc_current_rate bbr_tc_saved_values bbr_tc_saved_rate_display bbr_tc_rate_display \
     bbr_tc_snapshot_foreign bbr_tc_force_confirm bbr_tc_remove_confirm \
@@ -56,13 +66,14 @@ EOF
     # shellcheck disable=SC2329 # invoked indirectly by bbr_generate_config
     bbr_default_ipv6_iface() { echo eth0; }
     bbr_physical_memory_mb() { echo 512; }
+    bbr_conntrack_current() { return 1; }
     CONFIG=$(bbr_generate_config 12582912 12582912 relay 0)
     grep -qx 'net.ipv4.tcp_rmem = 4096 131072 12582912' <<< "$CONFIG" || { echo "Unsafe receive defaults were generated" >&2; exit 1; }
     grep -qx 'net.ipv4.tcp_wmem = 4096 16384 12582912' <<< "$CONFIG" || { echo "Unsafe send defaults were generated" >&2; exit 1; }
     ! grep -qE '^(vm\.min_free_kbytes|net\.ipv4\.(tcp_mem|tcp_adv_win_scale|tcp_tw_reuse|tcp_fin_timeout|tcp_keepalive_time))[[:space:]]*=' <<< "$CONFIG" \
         || { echo "Retired or risky TCP settings were generated" >&2; exit 1; }
     ! grep -qE '^net\.ipv4\.ip_forward[[:space:]]*=' <<< "$CONFIG" || { echo "Forwarding was enabled without consent" >&2; exit 1; }
-    ! grep -qE '^net\.netfilter\.nf_conntrack_max[[:space:]]*=' <<< "$CONFIG" || { echo "Conntrack was tuned without forwarding" >&2; exit 1; }
+    grep -qx 'net.netfilter.nf_conntrack_max = 131072' <<< "$CONFIG" || { echo "Relay preset without forwarding left conntrack at the kernel default" >&2; exit 1; }
 
     CONFIG=$(bbr_generate_config 12582912 12582912 relay 1)
     grep -qx 'net.ipv6.conf.default.accept_ra = 2' <<< "$CONFIG" || { echo "IPv6 forwarding profile is missing default accept_ra=2" >&2; exit 1; }
